@@ -1,0 +1,231 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['**']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: '1.96.0'
+
+jobs:
+  validate:
+    name: Validate release metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (node24)
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Assert checked-out commit
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Install Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Install actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          version='1.7.12'
+          archive="actionlint_${version}_linux_amd64.tar.gz"
+          base="https://github.com/rhysd/actionlint/releases/download/v${version}"
+          curl --fail --silent --show-error --location "$base/$archive" --output "$RUNNER_TEMP/$archive"
+          curl --fail --silent --show-error --location "$base/actionlint_${version}_checksums.txt" --output "$RUNNER_TEMP/checksums.txt"
+          (cd "$RUNNER_TEMP" && grep "  $archive$" checksums.txt | sha256sum --check --status)
+          mkdir -p "$RUNNER_TEMP/actionlint/bin"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/actionlint/bin" --strip-components=1 "actionlint_${version}/actionlint"
+          echo "$RUNNER_TEMP/actionlint/bin" >> "$GITHUB_PATH"
+      - name: Validate tag and changelog
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          if [[ "$REF_TYPE" == tag ]]; then
+            TAG="$REF_NAME"
+          else
+            TAG="$(cargo +"$RUST_TOOLCHAIN" run --locked -q -p xtask -- expected-tag)"
+          fi
+          cargo +"$RUST_TOOLCHAIN" run --locked -p xtask -- release-check "$TAG"
+          if [[ "$REF_TYPE" == tag ]]; then
+            cargo +"$RUST_TOOLCHAIN" run --locked -p xtask -- release-notes "$TAG" release-notes.md
+          fi
+          printf 'TAG=%s\n' "$TAG" >> "$GITHUB_ENV"
+      - name: Workflow lint
+        run: actionlint .github/workflows/release.yml
+      - name: Format
+        run: cargo +"$RUST_TOOLCHAIN" fmt --all -- --check
+      - name: Clippy
+        run: cargo +"$RUST_TOOLCHAIN" clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo +"$RUST_TOOLCHAIN" test --workspace --locked
+
+  native:
+    name: Native ${{ matrix.target }}
+    needs: validate
+    if: needs.validate.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (node24)
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Assert checked-out commit
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Install Rust
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt --component clippy --target "$TARGET"
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Install actionlint
+        shell: bash
+        env:
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          set -euo pipefail
+          version='1.7.12'
+          case "$RUNNER_OS" in
+            Linux) archive="actionlint_${version}_linux_amd64.tar.gz"; checksum='sha256sum' ;;
+            macOS) archive="actionlint_${version}_darwin_arm64.tar.gz"; checksum='shasum -a 256' ;;
+            *) echo "unsupported runner: $RUNNER_OS" >&2; exit 1 ;;
+          esac
+          base="https://github.com/rhysd/actionlint/releases/download/v${version}"
+          curl --fail --silent --show-error --location "$base/$archive" --output "$RUNNER_TEMP/$archive"
+          curl --fail --silent --show-error --location "$base/actionlint_${version}_checksums.txt" --output "$RUNNER_TEMP/checksums.txt"
+          expected="$(grep "  $archive$" "$RUNNER_TEMP/checksums.txt")"
+          test -n "$expected"
+          if [[ "$checksum" == 'sha256sum' ]]; then
+            printf '%s\n' "$expected" | (cd "$RUNNER_TEMP" && sha256sum --check --status)
+          else
+            printf '%s\n' "$expected" | (cd "$RUNNER_TEMP" && shasum -a 256 --check)
+          fi
+          mkdir -p "$RUNNER_TEMP/actionlint/bin"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/actionlint/bin" --strip-components=1 "actionlint_${version}/actionlint"
+          echo "$RUNNER_TEMP/actionlint/bin" >> "$GITHUB_PATH"
+      - name: Determine validated tag
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          if [[ "$REF_TYPE" == tag ]]; then
+            TAG="$REF_NAME"
+          else
+            TAG="$(cargo +"$RUST_TOOLCHAIN" run --locked -q -p xtask -- expected-tag)"
+          fi
+          printf 'TAG=%s\n' "$TAG" >> "$GITHUB_ENV"
+      - name: Verify native runner
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          rustc +"$RUST_TOOLCHAIN" -vV
+          test "$(rustc +"$RUST_TOOLCHAIN" -vV | awk '/^host:/ {print $2}')" = "$TARGET"
+      - name: Format native runner
+        run: cargo +"$RUST_TOOLCHAIN" fmt --all -- --check
+      - name: Clippy native runner
+        run: cargo +"$RUST_TOOLCHAIN" clippy --workspace --all-targets -- -D warnings
+      - name: Tests native runner
+        run: cargo +"$RUST_TOOLCHAIN" test --workspace --locked
+      - name: Build production binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo +"$RUST_TOOLCHAIN" build --locked --release -p sqlite-mcp --bin sqlite-mcp --target "$TARGET"
+      - name: Native smoke test
+        env:
+          TAG: ${{ env.TAG }}
+          TARGET: ${{ matrix.target }}
+          BINARY_PATH: target/${{ matrix.target }}/release/sqlite-mcp
+        run: cargo +"$RUST_TOOLCHAIN" run --locked -p xtask -- native-smoke "$TAG" "$BINARY_PATH"
+      - name: Package release archive
+        env:
+          TAG: ${{ env.TAG }}
+          TARGET: ${{ matrix.target }}
+          BINARY_PATH: target/${{ matrix.target }}/release/sqlite-mcp
+          OUTPUT_DIR: release-assets
+        run: cargo +"$RUST_TOOLCHAIN" run --locked -p xtask -- package "$TAG" "$TARGET" "$BINARY_PATH" "$OUTPUT_DIR"
+      - name: Upload release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1 (node24)
+        with:
+          name: release-${{ matrix.target }}
+          path: release-assets/sqlite-mcp-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: native
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (node24)
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - name: Install Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Download Linux artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1 (node24)
+        with:
+          name: release-x86_64-unknown-linux-gnu
+          path: release-assets
+      - name: Download macOS artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1 (node24)
+        with:
+          name: release-aarch64-apple-darwin
+          path: release-assets
+      - name: Prepare and publish release
+        env:
+          TAG: ${{ github.ref_name }}
+          EXPECTED_SHA: ${{ github.sha }}
+          ASSET_DIR: release-assets
+          GH_TOKEN: ${{ github.token }}
+        run: cargo +"$RUST_TOOLCHAIN" run --locked -p xtask -- publish "$TAG" "$EXPECTED_SHA" "$ASSET_DIR"

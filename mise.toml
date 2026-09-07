@@ -1,5 +1,6 @@
 [tools]
 rust = "1.96.0"
+actionlint = "1.7.12"
 
 [tasks.fmt]
 description = "Check Rust formatting"
@@ -17,6 +18,22 @@ run = "cargo test --workspace --locked"
 description = "Build workspace"
 run = "cargo build --workspace --locked"
 
+[tasks.workflow-check]
+description = "Lint the release workflow with actionlint"
+run = "actionlint .github/workflows/release.yml"
+
+[tasks.release-check]
+description = "Validate release metadata for a tag"
+run = "cargo run --locked -p xtask -- release-check {{arg(name='tag')}}"
+
+[tasks.release-build]
+description = "Build the production release binary for this host"
+run = "cargo build --locked --release -p sqlite-mcp --bin sqlite-mcp"
+
+[tasks.native-smoke]
+description = "Run native production stdio smoke test"
+run = "cargo run --locked -p xtask -- native-smoke {{arg(name='tag')}} {{arg(name='binary')}}"
+
 [tasks.ci]
 description = "Run all local verification"
-run = ["mise run fmt", "mise run lint", "mise run test", "mise run build"]
+depends = ["fmt", "lint", "test", "build", "workflow-check"]

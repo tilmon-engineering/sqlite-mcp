@@ -108,7 +108,11 @@ At time of writing, `mise run ci` passes on this machine: format check, Clippy w
 
 Shutdown and exit semantics: `Worker::shutdown` is asynchronous and resolves an idempotent shared completion only after rollback/autocommit verification, connection close, and worker-thread join (joined off the Tokio runtime threads); `Core::shutdown` aggregates a `ShutdownReport` of stable-sorted per-handle results plus registry cleanup errors, with derived overall success and identical reports for repeated callers. The binary's serving path always runs core cleanup after initialization and service outcomes; `ServeFailure` keeps the original initialization/service failure as its primary cause, attaches cleanup failures separately, and promotes a cleanup failure to primary when no service failure exists. A clean EOF or SIGINT with clean cleanup exits zero; any failure exits nonzero with stderr diagnostics that never include SQL or rows. rmcp 1.7 note: response-write failures are logged by the serving loop without ending the session; service failures surface through initialization errors and `waiting()`. Follow-ups on an expired handle (commit included) report `TX_EXPIRED`; expired handles recover by close/open.
 
-## 10. Required verification and synchronization
+## 10. Release and version contract
+
+The workspace Cargo version is the single source of truth for both product crates: the app and core versions must remain inherited and equal, and matching `Cargo.lock` entries are required. A release tag is exactly `v{workspace version}`; invalid or mismatched tags fail closed. The production CLI's explicit `--help` and `--version` output is the sole ordinary stdout exception to the stdout protocol-only rule, and its version is compiled with `env!("CARGO_PKG_VERSION")`, not a runtime override. Release documentation must describe the ubuntu-24.04 GNU/glibc baseline and unsigned/unnotarized macOS limits without claiming static or frictionless portability.
+
+## 11. Required verification and synchronization
 
 Tests are unconditional and cover tool discovery, absolute/exclusive paths, readonly engine enforcement, transaction persistence/modes, worker independence, busy/stale snapshots, authorizer/reprepare, single-statement parsing, savepoint atomicity, typed caps, schema freshness/overflow, cancellation/deadlines/expiry, shutdown/process death, envelopes, invalid config, and the documented workflow through real rmcp duplex and subprocess stdio tests. Before handoff run `mise run ci`, inspect protocol stdout/stderr, and report failures plainly.
 

@@ -101,6 +101,12 @@ Schema observation is invalidated by any DDL attempt (including denied or failed
 
 See [`DESIGN.md`](DESIGN.md) for the normative contract, state machine, error semantics, caps, SQL policy, and shutdown rules. See [`AGENTS.md`](AGENTS.md) for development workflow.
 
+## Release downloads and versioning
+
+Release binaries are built natively for `x86_64-unknown-linux-gnu` on **ubuntu-24.04** and `aarch64-apple-darwin` on an arm64 macOS runner. The Linux GNU binary carries the ubuntu-24.04 runner's glibc compatibility baseline; it is not a musl/static universal Linux build. The macOS binary is unsigned and unnotarized, so macOS Gatekeeper may require user approval and frictionless installation is not promised. Archives contain the `sqlite-mcp` executable and releases include `SHA256SUMS`.
+
+The compiled workspace Cargo version is the source of truth for the app and core crate. A release tag must be exactly `v{workspace version}`. Release notes are extracted from the matching changelog section only. Follow the [`release-sqlite-mcp` skill](.polytoken/skills/release-sqlite-mcp/SKILL.md) for the two-commit history sequence, prior published ancestor baseline, branch CI gate, immutable annotated tag, and draft recovery rules.
+
 ## Synchronization notes
 
 The documented workflow is synchronized with both the in-process fixture and the stdio subprocess fixture: each performs `get_schema` between transaction-local DDL and further statements, asserts success on the write path, and verifies the committed row is readable afterwards. Keep CLI flags, advertised tool schemas/descriptions, envelope JSON, typed-value spelling, and workflow fixtures synchronized in future changes.

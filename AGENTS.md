@@ -37,6 +37,10 @@ Reject relative/URI/`~` paths, NULs, directories, special files, missing/empty/i
 
 Cancellation must be token-scoped and worker-owned; commit and cleanup rollback are awaited and are not falsely reported. Preserve truthful transaction state after BUSY, cancellation, interruption, or cleanup failure. stdout remains MCP protocol-only; logs go to stderr and must not include SQL or rows by default.
 
+## Release workflow
+
+Release work uses the shared workspace Cargo version for the app and core crate in lockstep, preserves inheritance, and keeps `Cargo.lock` synchronized. The release skill lives at `.polytoken/skills/release-sqlite-mcp/SKILL.md`; validate it locally with `polytoken validate skill .polytoken/skills/release-sqlite-mcp/SKILL.md`. The documented utility commands are `cargo run --locked -p xtask -- release-check TAG` and `cargo run --locked -p xtask -- release-notes TAG OUTPUT_PATH`, with `mise release-check`, `mise release-build`, and `mise workflow-check` wrappers. Use the two-commit history sequence, including a provisional changelog from observed history followed by a final notes-only commit, and identify the previous published ancestor (or repository root for the first release). Branch CI must pass before an immutable annotated `v{workspace version}` tag is created at the exact tested SHA. Never move a published tag; use the skill's draft recovery procedure.
+
 ## Change workflow
 
 1. Read the relevant DESIGN.md section and existing tests before editing.

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sqlite-mcp-core", "crates/sqlite-mcp"]
+members = ["crates/sqlite-mcp-core", "crates/sqlite-mcp", "crates/xtask"]
 resolver = "3"
 
 [workspace.package]
@@ -23,3 +23,4 @@ uuid = { version = "1", features = ["v4", "serde"] }
 base64 = "0.22"
 toml = "0.9"
 tempfile = "3"
+serde_yaml = "0.9"
