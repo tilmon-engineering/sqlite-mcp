@@ -1,0 +1,115 @@
+# sqlite-mcp normative design
+
+This document is the v1 contract for the local SQLite MCP server. README.md is the compact user guide; AGENTS.md is the contributor guide. When implementation and this document differ, treat the difference as a contract defect requiring an explicit update and tests. This document describes intended behavior from the approved implementation plan; runtime/build claims are not implied unless reported as observed verification.
+
+## 1. Product boundary
+
+The server is a single-process MCP service over stdio. It accepts absolute filesystem paths supplied by agents, owns multiple independent SQLite handles, and exposes explicit transaction operations. There is no HTTP transport, database inventory, alias layer, per-database operator configuration, backup, import/export, deletion, arbitrary extension loading, or cross-file atomic transaction. One process/context owns the handles; SQLite file locking coordinates writers across processes. The bundled SQLite library is used. Versions observed from the locked build are Rust `1.96.0 (ac68faa20)`, rmcp `1.7.0`, rmcp-macros `1.7.0`, rusqlite `0.40.1`, libsqlite3-sys `0.38.2`, and bundled SQLite `3.53.2` from `sqlite3.h` `SQLITE_VERSION`. rmcp-macros is pinned to 1.7.0 because rmcp 1.7.0's caret requirement otherwise resolves macros 1.8.0, which is incompatible.
+
+The binary must keep stdout protocol-only. Diagnostics and operational logs use stderr and do not log SQL or result rows by default. `--config ABSOLUTE_TOML_PATH` is optional; configuration is validated before protocol startup and contains resource/time policies, never an allowlist of databases. Invalid configuration exits nonzero with a stderr diagnostic and emits no protocol bytes. `--help` and `--version` are ordinary CLI output only when explicitly requested.
+
+## 2. Public tools and lifecycle
+
+The advertised v1 tool set is exactly:
+
+| Tool | Contract |
+|---|---|
+| `create_database(path: string)` | Exclusively create and initialize a new database file; return normalized absolute path and journal mode; no handle. |
+| `open_database(path: string, readonly: bool)` | Open an existing valid initialized file with explicit fixed access; return opaque handle, actual access, path, journal mode, and schema-observation requirement. |
+| `list_handles()` | Return a bounded inventory of live handles with path, readonly, transaction, and schema-observation state. |
+| `get_schema(handle: string)` | Capture complete bounded schema metadata and an observation token. |
+| `begin_transaction(handle: string, mode: "deferred" | "immediate" = "deferred")` | Begin only after schema observation. `immediate` is rejected on readonly handles. |
+| `query(handle: string, sql: string, parameters: typed-value[] = [])` | Execute exactly one statement in the active transaction with positional SQLite-index bindings. |
+| `commit(handle: string)` | Commit and close active work, including read-only work. No active transaction is an explicit error. |
+| `rollback(handle: string)` | Roll back active work. Valid idle handles receive idempotent success. |
+| `close_database(handle: string)` | Close an idle handle. Active work is refused with the authoritative transaction state and exact commit/rollback next moves; failed close attempts that cannot verify cleanup leave the handle unusable (subsequent calls report `HANDLE_UNKNOWN` until a fresh open). |
+
+Creation then open is intentionally two-step. Opening never creates, initializes, or silently downgrades. `get_schema` is mandatory before begin and query. A handle has one worker-owned connection and at most one explicit transaction. Different handles may run concurrently and have no shared atomicity.
+
+Advertised tool schemas are closed objects: argument structs use `deny_unknown_fields`, unknown keys or an invalid mode are rejected with MCP `-32602` before any handler runs and with no handle/database/transaction side effects, `begin_transaction.mode` accepts exactly the lowercase `deferred`/`immediate` strings (default `deferred`), and the advertised schema is an inline enum without extra properties. Envelope `next_moves` are conservative: close refusals carry the authoritative handle state with exact `commit`/`rollback` moves, every create failure returns no next moves (an existing file is not proof of a valid SQLite database), and create success recommends `open_database`.
+
+### State machine
+
+A newly opened handle is `idle/unobserved`. A successful `get_schema` makes it `idle/observed`. `begin_transaction` moves it to `active` with a generated transaction ID and begin mode. `query` remains active, subject to schema freshness and transaction expiry. `commit` or `rollback` returns to idle and conservatively clears observation after local DDL; `close_database` removes only an idle handle. Unknown/closed handles are explicit errors. Idle expiry rolls back and records short-lived expired state so a subsequent operation reports `TX_EXPIRED`, never silently restarts work.
+
+Any attempted transaction-local DDL (`CREATE`, `ALTER`, or `DROP`) conservatively invalidates the schema observation, including denied or failed attempts; rollback of transaction-local DDL and stale external changes also require re-observation. `get_schema`, `commit`, and `rollback` remain available when an active transaction is stale. A deferred begin establishes a real snapshot and may fail if schema changed between observation and begin; an immediate begin exposes write contention early.
+
+## 3. Filesystem and connection semantics
+
+Only absolute literal paths are accepted. Reject relative paths, `~`, URI filenames, embedded NULs, directories, and special files. Do not expand environment variables, create parents, or treat canonicalization as a security sandbox. Normalize and expose an absolute path. On Linux, device/inode identity rejects duplicate opens through symlinks or hardlinks even when requested readonly differs; serialize registration checks to prevent same-process races.
+
+Creation uses exclusive filesystem `create_new`, retains the descriptor through initialization, detects replacement around SQLite open, initializes a valid header/schema, and returns failure without unlinking a path that may now identify another file. New files use WAL. Existing journal modes are preserved; do not automatically migrate them. WAL can produce `-wal` and `-shm` sidecars. Empty files and files without the SQLite header are rejected by open as `INVALID_DATABASE`, as are missing, directory, and special files. Existing files are opened with explicit readonly/readwrite flags without CREATE/URI; the schema must be queryable and actual SQLite access is checked with `db_readonly`, with no silent downgrade of requested write access.
+
+The identity checks are not hostile-filesystem-race proof. External replacement/rename/deletion of an open database is unsupported. Network filesystem locking is unsupported; use local filesystems with reliable SQLite locks. Foreign keys are enabled for new connections, but opening does not audit or repair historic violations.
+
+## 4. Workers, deadlines, contention, and shutdown
+
+Each handle has a dedicated connection-owning worker and bounded command queue (default 16). Long SQLite work never runs on Tokio executor threads and metadata enumeration must not wait on a global store lock. Worker state, `Connection::is_autocommit`, and observed lifecycle outcomes are authoritative.
+
+Defaults are a 30-second query budget, 60-second writable idle expiry, 600-second readonly idle expiry, and 32 handles. Busy waiting is bounded (default two seconds) and never replays mutations. Expiry is worker-owned: queued and executing requests count as activity; expiry starts/resets only after completed active requests, never reaps an executing request, rolls back on expiry, and reports expired state rather than reopening work. Shutdown is also an ordered worker command: queued commands retain their order, active cancellable query work is resolved, then rollback/close cleanup is awaited. `BEGIN DEFERRED` is default; `BEGIN IMMEDIATE` is explicit. BUSY/LOCKED errors report bounded-wait information and next actions. A failed commit may preserve a transaction; do not discard it merely because COMMIT returned BUSY. Once dispatched, commit and cleanup rollback are non-cancellable; later commands remain queued while the actual SQLite outcome is awaited and autocommit inspected. If cleanup or state becomes uncertain, invalidate/close and report possible loss of uncommitted work. Every public operation runs under a core-owned coordinator: authoritative publication (mutation-marker drain and invalidation, transaction publication/clearing, observation freshness, expiry tombstones) is performed by the coordinator rather than the caller's future, so a dropped caller abandons only its reply — never the publication. Publication of one operation strictly precedes the next gate-ordered operation on the same handle, and publication onto a registry entry removed concurrently (global shutdown or invalidation) reports `HANDLE_UNKNOWN` instead of panicking.
+
+Every request has its own cancellation token and deadline installed in the worker progress/busy callbacks. External tasks must not issue connection-wide interrupts; there is no `InterruptHandle`. Commit and cleanup rollback are non-cancellable once dispatched: await the actual result and inspect autocommit. EOF, service failure, and Ctrl-C initiate ordered worker shutdown, cancel active query work, await workers, roll back, and close. Process death relies on SQLite recovery and must not be described as a graceful rollback.
+
+## 5. SQL boundary and statement atomicity
+
+Install a fail-closed SQLite authorizer during prepare, step, and automatic reprepare; unknown actions are denied. Trusted worker scopes are limited to server-owned lifecycle/schema/configuration SQL; agent SQL cannot enter them. Deny agent transaction/savepoint control, ATTACH/DETACH, extension loading, TEMP objects, virtual tables, all PRAGMAs and `pragma_*` table-valued function access (including through views/triggers), writable schema/configuration changes, VACUUM/VACUUM INTO, and filesystem-output/maintenance operations. A stored-body structural guard rejects `CREATE VIEW` or `CREATE TRIGGER` containing `pragma_` references because SQLite does not expose those body references to the authorizer at CREATE time. The authorizer also protects trigger-induced operations and readonly connections. Ordinary SELECT/CTE/DML and transactional CREATE/ALTER/DROP of ordinary tables/indexes/views/triggers are allowed on writable handles. `EXPLAIN` of a denied statement is denied as well; `EXPLAIN QUERY PLAN` remains allowed when its underlying query is allowed.
+
+Validate exactly one compiled statement using SQLite parser/tail handling on the real connection before executing anything. Allow whitespace/comments/trailing semicolon; reject empty SQL, malformed tails, and a second statement. Never use regex splitting or execute_batch. Wrap every agent statement in a server-owned savepoint, including SELECT. On success drain to SQLITE_DONE, finalize, and release. On error, rollback-to/release if the outer transaction survives; earlier successful calls remain. If SQLite aborts the outer transaction (for example `OR ROLLBACK`) or savepoint restoration fails, report that observed fact and never recreate the transaction.
+
+Output caps do not stop execution: drain DML `RETURNING` fully, discard excess rows only after completion, and report `execution_complete`. Defaults are 500 rows, 1 MiB result payload, 1 MiB individual SQLite length, 100 KiB SQL, 256 columns, 1000 parameters, expression depth 100, and 50 compound SELECT terms. Configurable positive overrides require bounded sensible maxima. No automatic LIMIT or pagination cursor is added; `next_moves` recommends explicit ordered/keyset pagination.
+
+## 6. Typed values and results
+
+Parameters are positional and validated before SQL. Tagged values are null, integer (decimal string), real (finite string input), text, and blob (base64). Reject integer overflow, malformed base64, non-finite/overflow real input, and unsupported `text_bytes` input before SQL. REAL output uses round-trip decimal strings and explicit `Infinity`/`-Infinity` strings when SQLite produces them; NaN round-tripping is not promised. Preserve TEXT/BLOB distinction. Invalid UTF-8 SQLite text is output-only `text_bytes` with base64 rather than lossy replacement.
+
+A successful query result includes ordered columns (name and optional declared type), rows, `rows_returned`, truncation, `execution_complete`, and per-statement affected-row count. SELECT/DDL must not inherit a previous DML change count. The result-byte budget measures the serialized UTF-8 JSON object `{"columns":…,"rows":…}` exactly — excluding the envelope, `rows_returned`, `truncated`, `execution_complete`, and `changes` — and is enforced before the savepoint is released, so an oversized or failing result never persists its mutation and no partial success is returned. Do not return partial rows when the payload exceeds the cap; restore the savepoint and return `RESULT_TOO_LARGE`.
+
+## 7. Schema contract
+
+`get_schema` returns bounded complete `sqlite_schema` DDL plus `table_xinfo`, index/index-column details, foreign-key lists, and table-list strict/WR (WITHOUT ROWID) flags for ordinary tables, views, indexes, and triggers. Use trusted server-owned PRAGMAs for metadata; do not parse DDL for strict/WR flags. Capture identity and schema version in the same snapshot. Validate required metadata columns against bundled SQLite at startup; unsupported versions fail clearly rather than silently omitting fields.
+
+Default schema cap is 2 MiB and measures the complete serialized schema result. If incomplete, return `SCHEMA_TOO_LARGE` and do not satisfy the schema gate. Outside a caller transaction the observation runs as a managed read transaction (`BEGIN DEFERRED` … `COMMIT`, with non-cancellable verified rollback on failure); inside a caller transaction the read stays unmanaged and caller ownership is preserved. Before publishing begin, compare schema version with the observed token; mismatch rolls back begin and returns `SCHEMA_STALE`. During an active snapshot, external DDL becomes visible only to later transactions: the managed read enumerates one coherent pre-DDL snapshot (WAL snapshot isolation). Schema-observation invalidation policy: any attempted DDL invalidates the observation whatever its outcome (including denied stored-body `CREATE VIEW`/`CREATE TRIGGER` and failed execution); a DML attempt invalidates only on success; a failed DML leaves the handle usable (statement atomicity); pre-dispatch rejections (parameter/size/unknown-handle) mark nothing. An invalidated observation gates subsequent queries and begins with `SCHEMA_REQUIRED` until re-observation; failed or oversized observations never grant freshness, and a managed cleanup failure invalidates the handle.
+
+## 8. Envelope, errors, and recovery
+
+Every dispatched tool outcome uses `envelope_version = 1`, `handle_state` (null when unresolved, otherwise opaque ID, absolute path, readonly, journal mode, transaction ID/mode or null, and schema observation state), `next_moves`, and exactly one of `result` or `error`. MCP `isError` is true for errors; structured content, when supported, is accompanied by equivalent JSON text. MCP `notifications/cancelled` cancels only that request's token; an interrupted request reports `CANCELLED` (client cancel) or `DEADLINE_EXCEEDED` (query deadline) with truthful transaction state, and `query` without an active transaction reports `NO_TX_OPEN`.
+
+Errors contain a stable class, concrete message, and `transaction_open`/`transaction_continuable` booleans (plus SQLite numeric codes where applicable). The `tools.rs` envelope classifier's exact class set is: `HANDLE_UNKNOWN` (UnknownHandle), `TX_ALREADY_OPEN` (TransactionOpen), `SCHEMA_REQUIRED` (SchemaRequired), `SCHEMA_STALE` (SchemaStale), `TX_EXPIRED` (TransactionExpired), `DATABASE_ALREADY_OPEN` (AlreadyOpen), `SCHEMA_TOO_LARGE` (SchemaTooLarge), `CANCELLED` (Cancelled: client cancellation interrupted the request), `DEADLINE_EXCEEDED` (DeadlineExceeded: the configured query deadline interrupted the request), `BUSY_SNAPSHOT` (BusySnapshot: stale-snapshot upgrade failure), `HANDLE_LIMIT` (HandleLimitReached), `INVALID_DATABASE` (InvalidDatabase), `NO_TX_OPEN` (an error message containing `no transaction` or `transaction required`), `BUSY` (Busy/Locked variants and any other error message containing `busy`), and `INTERNAL` for every other CoreError, including readonly-mode rejection, policy/parameter/statement errors, path/configuration, and other worker/SQLite/I/O failures. An interrupt may abort the whole outer transaction ("no transaction is active" with autocommit restored is benign and reported truthfully); cleanup that cannot restore autocommit invalidates the handle and reports `handle invalidated; lost uncommitted work`. These booleans are observed state, not advice to retry the same call. `next_moves` names concrete handles/paths and literal valid tools without raw SQL or parameter values.
+
+## 9. Configuration and delivery contract
+
+The TOML model is process-wide (not per-handle or per-database) and loaded once at startup before serving. It uses `serde(deny_unknown_fields)` and rejects unknown keys and invalid values before any MCP protocol bytes are emitted. Every setting has a positive validated bound; the explicit finite bounds are shown where defined by the loader.
+
+| Field | Default | Validated bound / meaning |
+|---|---:|---|
+| `max_handles` | `32` | Positive; 1..=1024. Maximum live handles. |
+| `queue_capacity` | `16` | Positive; 1..=4096. Per-handle command queue capacity. |
+| `query_timeout_ms` | `30000` | Positive; 1..=300000. Query/deadline budget in milliseconds. |
+| `writable_idle_seconds` | `60` | Positive; 1..=86400. Writable transaction idle expiry. |
+| `readonly_idle_seconds` | `600` | Positive; 1..=604800. Readonly transaction idle expiry. |
+| `result_row_limit` | `500` | Positive; 1..=100000. Maximum returned rows. |
+| `result_byte_limit` | `1048576` | Positive; 1..=67108864. Maximum serialized selected result payload (columns+rows) bytes. |
+| `schema_byte_limit` | `2097152` | Positive; 1..=67108864. Maximum complete schema payload bytes. |
+| `cell_byte_limit` | `1048576` | Positive; 1..=67108864. Maximum individual SQLite value bytes. |
+| `busy_wait_ms` | `2000` | Positive; 1..=60000. Bounded busy/locked wait in milliseconds. |
+| `sql_byte_limit` | `102400` | Positive; 1..=1048576. Maximum SQL text bytes (byte length only; digit content is not a limit criterion). |
+| `column_limit` | `256` | Positive; 1..=2048. Maximum result columns (application ceiling only; engine hard limits may reject lower). |
+| `parameter_limit` | `1000` | Positive; 1..=32766. Maximum positional parameters; the configured value is the single source of truth (the historical 1000 hardcode is gone). |
+| `expression_depth` | `100` | Positive; 1..=1000. SQLite expression-depth limit. |
+| `compound_terms` | `50` | Positive; 1..=500. Maximum compound SELECT terms. |
+
+These are the approved application ceilings. SQLite's compiled-in hard maxima may be lower than a configured ceiling; startup installs the engine limits with checked conversion and verifies the effective values by reading them back, rejecting unsupported values before any protocol bytes. Aggregate memory across handles is not capped by these ceilings.
+
+Engine-limit application: `SQLITE_LIMIT_LENGTH` (cell bytes), `SQLITE_LIMIT_EXPR_DEPTH`, `SQLITE_LIMIT_COMPOUND_SELECT`, and `SQLITE_LIMIT_VARIABLE_NUMBER` (parameters) are set on every worker connection; `sql_byte_limit` and `column_limit` are enforced in the Rust query path (engine SQL/column caps would break the server's own schema-introspection statements). Result rows/bytes are capped by materialization checks.
+
+Keep `config.example.toml` loadable by the strict implementation and its example test. Fixed v1 invariants—absolute paths, exclusive creation, one statement per query, authorizer policy, worker ownership, schema gate, and explicit commit/rollback—are not configuration switches.
+
+At time of writing, `mise run ci` passes on this machine: format check, Clippy with `-D warnings`, 120 tests, and locked build. This is an observed result, not a guarantee for other machines. The locked dependency/runtime versions are Rust `1.96.0 (ac68faa20)`, rmcp `1.7.0`, rmcp-macros `1.7.0`, rusqlite `0.40.1`, libsqlite3-sys `0.38.2`, and bundled SQLite `3.53.2` from `sqlite3.h` `SQLITE_VERSION`.
+
+Shutdown and exit semantics: `Worker::shutdown` is asynchronous and resolves an idempotent shared completion only after rollback/autocommit verification, connection close, and worker-thread join (joined off the Tokio runtime threads); `Core::shutdown` aggregates a `ShutdownReport` of stable-sorted per-handle results plus registry cleanup errors, with derived overall success and identical reports for repeated callers. The binary's serving path always runs core cleanup after initialization and service outcomes; `ServeFailure` keeps the original initialization/service failure as its primary cause, attaches cleanup failures separately, and promotes a cleanup failure to primary when no service failure exists. A clean EOF or SIGINT with clean cleanup exits zero; any failure exits nonzero with stderr diagnostics that never include SQL or rows. rmcp 1.7 note: response-write failures are logged by the serving loop without ending the session; service failures surface through initialization errors and `waiting()`. Follow-ups on an expired handle (commit included) report `TX_EXPIRED`; expired handles recover by close/open.
+
+## 10. Required verification and synchronization
+
+Tests are unconditional and cover tool discovery, absolute/exclusive paths, readonly engine enforcement, transaction persistence/modes, worker independence, busy/stale snapshots, authorizer/reprepare, single-statement parsing, savepoint atomicity, typed caps, schema freshness/overflow, cancellation/deadlines/expiry, shutdown/process death, envelopes, invalid config, and the documented workflow through real rmcp duplex and subprocess stdio tests. Before handoff run `mise run ci`, inspect protocol stdout/stderr, and report failures plainly.
+
+Implementation agents must synchronize README examples, tool descriptions/schemas, envelope field names, typed-value spelling, actual CLI flags, config loader, and workflow fixtures with this contract. Changes outside the four documentation files are intentionally out of scope for this documentation task.

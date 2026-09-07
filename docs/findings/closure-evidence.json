@@ -1,0 +1,389 @@
+{
+  "$schema_note": "Orchestrator-owned durable RED/GREEN evidence manifest. Logs live in the session evidence directory; raw tool output also retained under shell/. red2 logs are instrumentation-phase REDs recorded during GREEN sub-phase 1 per plan TDD protocol (hook call sites added without behavioral correction).",
+  "prefix_fingerprints": "evidence/prefix-fingerprints.txt",
+  "findings": {
+    "F-01": {
+      "title": "close race registry unwrap",
+      "status": "green",
+      "owner": "L",
+      "tests": [
+        "close_waits_for_publication",
+        "close_racing_begin_refuses_active",
+        "close_reserves_identity_until_closed",
+        "close_does_not_block_other_handles"
+      ],
+      "red": {
+        "note": "baseline probes were weak; strengthened tests pass against the reworked close path",
+        "log": "F-01-02-red.log",
+        "log_sha256": "ff6210a78209333569770dbd768bb22187486da27aaa226adba4ed2b2336a7d2"
+      },
+      "green": {
+        "status": "verified-after-review-fix",
+        "note": "review-high fix: per-handle operation gates (gates map) serialize begin/commit/rollback/close/query/observe per handle, so close can no longer race a concurrently publishing begin (the get_mut unwrap panic and false-success scenarios are structurally prevented); regression_lifecycle 17/17 green after fix. RESIDUAL CLOSED: caller-independent publication landed (Core::coordinate per-operation coordinator; publication strictly precedes next gate-ordered execution; get_mut unwrap hardened to UnknownHandle); deterministic real-drop regressions green (RED/GREEN logs in lifecycle review note); capacity-bounded FIFO admission queue remains out of scope (admission bounding, never a proven live symptom)",
+        "log": "F-01-02-green.log",
+        "log_sha256": "c6aff0ee231523515faa9f7dd9930f4929360f5a793c87c018867a795e575743"
+      }
+    },
+    "F-02": {
+      "title": "registry lock across shutdown await",
+      "status": "green",
+      "owner": "L",
+      "tests": [
+        "concurrent_shutdown_joins_all_workers",
+        "shutdown_report_scope_and_idempotence",
+        "close_failure_identity_reopen_matrix"
+      ],
+      "red": {
+        "note": "same instrumentation-gated completion as F-01",
+        "log": "F-01-02-red.log",
+        "log_sha256": "ff6210a78209333569770dbd768bb22187486da27aaa226adba4ed2b2336a7d2"
+      },
+      "green": {
+        "status": "verified-integrated",
+        "note": "async Worker::shutdown -> Result<ShutdownStatus, WorkerShutdownError> with rollback verification + off-runtime thread join + idempotent OnceCell completion; Core::shutdown -> ShutdownReport (sorted, derived success, idempotent); review-high fix: worker shutdown token now wired into busy retries AND progress callbacks so shutdown interrupts active queries/busy waits; SERVER_SHUTDOWN classified truthfully (never fake cancel/deadline)",
+        "log": "F-03-green.log"
+      }
+    },
+    "F-03": {
+      "title": "shutdown cancellation and exit status",
+      "status": "green",
+      "owner": "L",
+      "tests": [
+        "shutdown_interrupts_progress_and_busy",
+        "stdio_eof_active_query_cleanup",
+        "stdio_sigint_cleanup",
+        "stdio_service_failure_nonzero",
+        "shutdown_cleanup_failure_reported",
+        "service_error_with_cleanup_failure_preserves_both",
+        "shutdown_report_joins_all_failures"
+      ],
+      "red": {
+        "command": "mise exec -- cargo test --locked -p sqlite-mcp --test regression_shutdown",
+        "exit_status": 101,
+        "assertions": [
+          "stdio_service_failure_nonzero: server did not exit within 5s after malformed input (ignored waiting error / missing cleanup)",
+          "service_error_with_cleanup_failure_preserves_both: same defect"
+        ],
+        "log": "F-03-red.log",
+        "log_sha256": "d4ead2adaee248a37ec7bdb1a2086de7d42671ecf1fb3739ca630c163a9fdc31"
+      },
+      "green": {
+        "status": "verified-integrated",
+        "note": "orchestrator seam migration: waiting() errors preserved as ServeFailure primary; cleanup always runs; ConnectionRollback fault site added to worker Shutdown arm; SIGINT wired via serve_with_transport_and_ct + tokio::select onto the same cleanup path. RMCP 1.7 SEMANTICS (documented): response-write failures are logged, not fatal - the session stays alive until input EOF, so the deterministic service-failure test uses the initialize-error path and the both-causes test uses EOF + injected ConnectionRollback fault. Tests redesigned accordingly; original malformed-input premise was not a real service failure per pinned API",
+        "log": "F-03-green.log"
+      }
+    },
+    "F-04": {
+      "title": "config validation gaps",
+      "status": "green",
+      "owner": "C",
+      "tests": [
+        "config_all_field_boundaries",
+        "config_policy_covers_serialized_fields",
+        "invalid_config_matrix_before_serving",
+        "engine_limit_readback_and_checked_conversion",
+        "configured_parameter_limit_single_source"
+      ],
+      "red": {
+        "commands": [
+          "mise exec -- cargo test --locked -p sqlite-mcp-core --features test-support --test regression_config_limits (exit 101)",
+          "mise exec -- cargo test --locked -p sqlite-mcp --test regression_config_startup (exit 101)"
+        ],
+        "assertions": [
+          "config_all_field_boundaries: query_timeout_ms=300001 accepted",
+          "configured_parameter_limit_single_source: ?1001 rejected with too many parameters (hardcoded 1000)",
+          "invalid_config_matrix_before_serving: max+1 reached MCP serving instead of invalid-config diagnostic"
+        ],
+        "logs": [
+          "F-04-red-core.log",
+          "F-04-red-binary.log"
+        ],
+        "prefix_files": {
+          "config.rs": "0653e72b8d2d6a112a0feed86d8747e28c9103d8eb5eb059a53477911fae6905",
+          "sql.rs": "d24fdf190ad30902e87cbd27fccaf81f934f2f46e8d4b0d5132a14da9243e4ad",
+          "worker/limits.rs": "9cfbb2245d0a05f88d1c0b8954decc4b2c03a8cd303de2a82fc4c95b0454bc5e"
+        }
+      },
+      "green": {
+        "status": "verified-integrated",
+        "note": "all five tests pass including configured_parameter_limit_single_source after orchestrator switched query.rs to validate_with_limit and deleted the legacy 1000 wrapper (integration seam handoff from C/Q)",
+        "integration_edits": [
+          "query.rs call switched to validate_with_limit(config.parameter_limit)",
+          "sql.rs legacy validate wrapper deleted",
+          "regression_config_limits un-ignored"
+        ]
+      }
+    },
+    "F-05": {
+      "title": "create database fd replacement window",
+      "status": "green",
+      "owner": "F",
+      "tests": [
+        "create_replacement_checkpoint_matrix",
+        "create_descriptor_retained_through_close",
+        "create_identity_residual_contract"
+      ],
+      "red": {
+        "command": "mise exec -- cargo test --locked -p sqlite-mcp-core --features test-support --test regression_create_identity",
+        "exit_status": 101,
+        "assertions": [
+          "create_replacement_checkpoint_matrix: checkpoint PreOpen silently accepted replacement",
+          "create_descriptor_retained_through_close: checkpoint PostInit silently accepted replacement"
+        ],
+        "note": "three pure instrumentation emit call sites added in create.rs (PreOpen/PostOpen/PostInit)",
+        "log": "F-05-red.log",
+        "prefix_files": {
+          "paths.rs": "1c046cf07665a27f52bc8075e3ec6aba9d38ddd444a4e8c60b12793f8bd4ca19"
+        }
+      },
+      "green": {
+        "status": "verified-integrated",
+        "note": "all four tests pass; orchestrator fixed the test's single-threaded-runtime starvation (observe-swap-release moved into spawn_blocking) so all three checkpoints genuinely detect replacements; matrix subcases now independent",
+        "log": "F-05-green.log",
+        "files": {
+          "create.rs": "3a1b0a1aa67f1c0ed05f73dd0300c8b4dcee8908ed260aab1cd69b9fc43dd4bd"
+        }
+      }
+    },
+    "F-06": {
+      "title": "success-only mutation invalidation",
+      "status": "green",
+      "owner": "Q",
+      "tests": [
+        "failed_ddl_invalidates_immediately",
+        "denied_stored_ddl_invalidates",
+        "queued_mutation_markers_isolated",
+        "dropped_caller_publishes_mutation_state",
+        "predispatch_rejection_keeps_observation"
+      ],
+      "red": {
+        "command": "mise exec -- cargo test --locked -p sqlite-mcp-core --features test-support --test regression_query_schema failed_ddl_invalidates_immediately (and denied_stored_ddl_invalidates)",
+        "exit_status": 101,
+        "assertions": [
+          "failed_ddl_invalidates_immediately: failed DDL must invalidate before the next call (observed=true)",
+          "denied_stored_ddl_invalidates: same defect"
+        ],
+        "controls_passing": [
+          "queued_mutation_markers_isolated",
+          "dropped_caller_publishes_mutation_state",
+          "predispatch_rejection_keeps_observation"
+        ],
+        "log": "F-06-red.log"
+      },
+      "green": {
+        "status": "verified-integrated",
+        "note": "MutationSignal implemented in policy.rs with unconditional post-request drain; all five tests pass",
+        "log": "F-06-green.log"
+      }
+    },
+    "F-07": {
+      "title": "idle expiry accounting",
+      "status": "green",
+      "owner": "L",
+      "tests": [
+        "expired_direct_commit_never_persists",
+        "expired_followup_controls_exact_class",
+        "queued_activity_and_idle_boundary"
+      ],
+      "red": {
+        "command": "mise exec -- cargo test --locked -p sqlite-mcp-core --features test-support --test regression_lifecycle",
+        "exit_status": 101,
+        "assertions": [
+          "expired_direct_commit_never_persists: expired commit was accepted",
+          "expired_followup_controls_exact_class: follow-up lost TX_EXPIRED class"
+        ],
+        "log": "F-07-08-red.log",
+        "log_sha256": "be08f04092310e6e528ae7481b3379a07b5bd90566627387da3cda2415de2dde"
+      },
+      "green": {
+        "status": "verified-integrated",
+        "note": "expiry gate precedes controls on Run and Control paths; typed TX_EXPIRED preserved; all named tests pass in integrated regression_lifecycle run (17/17)",
+        "log": "F-07-08-green.log",
+        "log_sha256": "7b899d4d591130bb48fa4e193b210de5881d77f3da461d3f2ba92283d294ed55"
+      }
+    },
+    "F-08": {
+      "title": "cancelled before dispatch executes",
+      "status": "green",
+      "owner": "L",
+      "tests": [
+        "queued_cancel_never_enters_closure",
+        "queued_deadline_preserves_transaction",
+        "interruption_precedence_matrix",
+        "expiry_rollback_failure_invalidates"
+      ],
+      "red": {
+        "command": "mise exec -- cargo test --locked -p sqlite-mcp-core --features test-support --test regression_lifecycle queued_cancel_never_enters_closure",
+        "exit_status": 101,
+        "assertions": [
+          "queued_cancel_never_enters_closure: cancelled request executed Ok(QueryResult changes:1)"
+        ],
+        "log": "F-07-08-red.log",
+        "log_sha256": "be08f04092310e6e528ae7481b3379a07b5bd90566627387da3cda2415de2dde"
+      },
+      "green": {
+        "status": "verified-integrated",
+        "note": "worker pre-dispatch cancellation/deadline gate: cancelled requests execute zero SQL and preserve the untouched outer transaction; precedence shutdown > expired > client > deadline; expiry rollback fault consultation wired; named tests pass in regression_lifecycle (17/17) and regression_expiry",
+        "log": "F-07-08-green.log"
+      }
+    },
+    "F-09": {
+      "title": "result cap after savepoint release",
+      "status": "green",
+      "owner": "Q",
+      "tests": [
+        "returning_byte_overflow_atomic",
+        "result_payload_exact_boundaries",
+        "result_encoding_boundary_matrix",
+        "returning_row_cap_still_drains",
+        "overflow_cleanup_failure_invalidates"
+      ],
+      "red": {
+        "command": "mise exec -- cargo test --locked -p sqlite-mcp-core --features test-support --test regression_result_atomicity",
+        "exit_status": 101,
+        "assertions": [
+          "returning_byte_overflow_atomic: persisted row count left=1 right=0 after commit (rejected mutating result persisted)",
+          "result_payload_exact_boundaries: budget N (N=57) wrong outcome",
+          "result_encoding_boundary_matrix: exact N (N=79) wrong outcome"
+        ],
+        "log": "F-09-red.log"
+      },
+      "green": {
+        "status": "verified-integrated",
+        "note": "all five tests pass including overflow_cleanup_failure_invalidates (SavepointRestore fault consumed at the rollback-to/release boundary); exact columns+rows accounting before savepoint release; typed ResultTooLarge",
+        "log": "F-09-green.log"
+      }
+    },
+    "F-10": {
+      "title": "schema snapshot tear",
+      "status": "green",
+      "owner": "Q",
+      "tests": [
+        "schema_snapshot_external_ddl_interleaving",
+        "readonly_schema_snapshot_interleaving",
+        "schema_read_preserves_caller_transaction",
+        "schema_failure_cleanup_and_gate",
+        "schema_cleanup_failure_invalidates"
+      ],
+      "red": {
+        "note": "blocked-RED resolved: hook sites (SchemaVersionRead emit + ManagedSchemaCleanup fault consumption on both cleanup paths) landed, tests un-ignored and pass deterministically after the managed-read fix; original RED intent (snapshot tear) reproducible only against the pre-fix source",
+        "log": "F-10-red.log"
+      },
+      "green": {
+        "status": "verified-integrated",
+        "note": "worker-inside is_autocommit managed BEGIN DEFERRED/COMMIT with verified rollback; WAL snapshot isolation proven by barrier-paused external-DDL interleaving on writable and readonly handles; ManagedSchemaCleanup fault on either cleanup path invalidates and removes the handle; caller transactions preserved; test serialization (HOOK_LOCK) prevents process-global fault/registry theft",
+        "log": "F-10-green.log"
+      }
+    },
+    "F-11": {
+      "title": "argument schema laxity",
+      "status": "green",
+      "owner": "P",
+      "tests": [
+        "closed_tool_schema_matrix",
+        "unknown_argument_dispatch_no_effects",
+        "invalid_mode_core_and_protocol",
+        "valid_mode_default_and_readonly"
+      ],
+      "red": {
+        "command": "mise exec -- cargo test --locked -p sqlite-mcp-core --features test-support --test regression_protocol_contract",
+        "exit_status": 101,
+        "assertions": [
+          "closed_tool_schema_matrix: no entry found for key (missing mode enum)",
+          "unknown_argument_dispatch_no_effects: unknown key executed successfully, returned CallToolResult",
+          "invalid_mode_core_and_protocol: invalid mode banana must be rejected before BEGIN"
+        ],
+        "log": "F-11-red.log",
+        "log_sha256": "113d043da70d9d2dff8dcdea1985e8dae87b066f9e9907da084aa5e4b6fde706",
+        "prefix_files": {
+          "tools.rs": "0224cf8c99c993b8488390ea99a7ba03b67c4e0d26d566b2d4b35e608ed1d240"
+        }
+      },
+      "green": {
+        "status": "verified-integrated",
+        "note": "deny_unknown_fields on all argument structs incl. closed NoArgs for list_handles; inline lowercase mode enum (deferred/immediate per DESIGN; not required); invalid modes rejected via TransactionMode::parse admission gate (L landed, evidence F-11-mode-gate.log sha256 3a68db6d42cc5aaf50a47688764c7f0ad3162a08afd30fae16b425a3df992244); mode default-key assertion documented as rmcp 1.7/schemars 1.2 limitation with default behavior asserted functionally"
+      }
+    },
+    "F-12": {
+      "title": "locked class misclassification",
+      "status": "green",
+      "owner": "P",
+      "tests": [
+        "core_error_envelope_variant_matrix"
+      ],
+      "red": {
+        "command": "mise exec -- cargo test --locked -p sqlite-mcp-core --lib core::error::tests",
+        "exit_status": 101,
+        "assertions": [
+          "SQLite code 6 classified as Worker(Sqlite(...DatabaseLocked...)) instead of BUSY"
+        ],
+        "log": "F-12-red.log"
+      },
+      "green": {
+        "status": "verified-integrated",
+        "note": "typed classifier handles BUSY/LOCKED with synthetic extended-code primary derivation, BusySnapshot preserved; integration test passes in full run Independent review: integration-level LOCKED fixture remains unavailable (unit-level typed 6/262 classification is the verified surface); classifier exhaustiveness for future WorkerError variants is a documented maintainability residual.",
+        "log": "F-12-green.log"
+      }
+    },
+    "F-13": {
+      "title": "envelope state fidelity",
+      "status": "green",
+      "owner": "P",
+      "tests": [
+        "close_active_envelope_exact",
+        "create_failure_recovery_matrix",
+        "structured_text_envelopes_equal"
+      ],
+      "red": {
+        "command": "mise exec -- cargo test --locked -p sqlite-mcp-core --features test-support --test regression_envelope_contract",
+        "exit_status": 101,
+        "assertions": [
+          "close_active_envelope_exact: handle_state Null vs expected known handle id",
+          "create_failure_recovery_matrix: next_moves [\"open_database\"] vs expected [] for all create failures"
+        ],
+        "log": "F-12-13-red.log",
+        "log_sha256": "6a71e16d0c326a4600e86f1c9c61c11df0dc3b8d3671cabfc40388890310f256",
+        "prefix_files": {
+          "envelope.rs": "46094d47893c36c78d9a22894478bd19b740757d19214948211f4c46f71eed31"
+        }
+      },
+      "green": {
+        "status": "verified-integrated",
+        "note": "close-active authoritative snapshot with commit/rollback next moves, unknown close null, create failures return no next moves, structured==text with isError true; all four envelope tests pass in integrated tree",
+        "log": "F-12-13-green.log"
+      }
+    },
+    "F-14": {
+      "title": "numeric literal preflight",
+      "status": "green",
+      "owner": "Q",
+      "tests": [
+        "bare_digits_are_parser_errors",
+        "sql_utf8_byte_boundaries",
+        "numeric_select_values_execute"
+      ],
+      "red": {
+        "command": "mise exec -- cargo test --locked -p sqlite-mcp-core --features test-support --test regression_query_schema bare_digits_are_parser_errors",
+        "exit_status": 101,
+        "assertions": [
+          "bare_digits_are_parser_errors: parser error was misclassified: SQL exceeds configured byte limit"
+        ],
+        "controls_passing": [
+          "sql_utf8_byte_boundaries",
+          "numeric_select_values_execute"
+        ],
+        "log": "F-14-red.log"
+      },
+      "green": {
+        "status": "verified-integrated",
+        "note": "digit-content clause removed; bare digits under the cap receive parser/policy errors; byte boundaries unchanged",
+        "log": "F-14-green.log"
+      }
+    }
+  },
+  "review_outcomes": {
+    "lifecycle": "3 HIGH fixed (per-handle op gates; shutdown token in busy/progress callbacks with truthful SERVER_SHUTDOWN class; idle-expiry tombstone publication). Dropped-caller publication residual CLOSED by the caller-independent publication coordinator (Core::coordinate: begin/commit/rollback/query/get_schema bodies moved into *_admitted coordinator-owned publication; get_mut unwrap hardened to UnknownHandle). Deterministic real-drop regressions: drop_after_admission_publishes_once, dropped_commit_publishes_idle_state, dropped_query_expiry_publishes_tombstone, dropped_caller_publishes_mutation_state, dropped_observe_publishes_observation. RED log sha256 7faa3d865cc24c14d4cdec701cb195d03bc3b106b65ace486ffb1e0a1d482403 (all five fail on their defect-specific assertions against pre-fix source), GREEN log sha256 17a5916d1561026f4dd59b340441933cddc4574653b85a447a95ff6bacf51559. Remaining scope note: capacity-bounded FIFO admission queue unimplemented (bounds admission, not publication).",
+    "atomicity": "F-04 MEDIUM fixed (Core::new engine-limit probe on disposable in-memory connection before serving). F-06 dropped-future residual CLOSED by the caller-independent publication coordinator (see lifecycle note for RED/GREEN evidence).",
+    "protocol": "F-12 GREEN scope corrected to unit-level classification. Harness fixes: persistent buffered control reader (reply loss), bounded post-kill reap, reset_registry clears faults. F-10 RED honesty documented in manifest and finding closure."
+  }
+}

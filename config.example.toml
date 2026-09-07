@@ -1,0 +1,33 @@
+# Resource and timeout policy for sqlite-mcp.
+# This file contains no database inventory: agents supply absolute paths to tools.
+
+# Maximum live database handles (1..=1024).
+max_handles = 32
+
+# Bounded per-handle worker command queue (1..=4096).
+queue_capacity = 16
+
+# Query/deadline budget in milliseconds (1..=300000).
+query_timeout_ms = 30000
+
+# Idle transaction expiry (writable 1..=86400; readonly 1..=604800). Expiry rolls back; it never commits or reopens work.
+writable_idle_seconds = 60
+readonly_idle_seconds = 600
+
+# Output bounds: rows 1..=100000; bytes 1..=67108864. Results are fully executed before excess rows are discarded.
+result_row_limit = 500
+result_byte_limit = 1048576
+schema_byte_limit = 2097152
+
+# Busy/locked wait budget in milliseconds (1..=60000).
+busy_wait_ms = 2000
+
+# SQL bytes 1..=1048576; individual cell bytes 1..=67108864.
+sql_byte_limit = 102400
+cell_byte_limit = 1048576
+
+# Structural limits: columns 1..=2048 (application ceiling; SQLite engine hard limits may reject lower), parameters 1..=32766, expression depth 1..=1000, compound terms 1..=500.
+column_limit = 256
+parameter_limit = 1000
+expression_depth = 100
+compound_terms = 50

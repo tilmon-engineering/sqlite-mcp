@@ -1,0 +1,18 @@
+# Project-local Polytoken configuration for the sqlite-mcp repository.
+#
+# Adds the SQLite MCP server built from this repo so sessions started in
+# this directory can test it. The release binary must exist; rebuild it with:
+#   mise exec -- cargo build --release --locked
+#
+# Server names are prefixed in tool calls, e.g. mcp__sqlite-mcp__query.
+mcp_servers:
+  sqlite-mcp:
+    transport: stdio
+    command: /var/home/edwards/Projects/sqlite-mcp/target/release/sqlite-mcp
+    # Diagnostics only: the server writes logs to stderr and keeps stdout
+    # strictly for MCP protocol bytes, so stdout logging stays off.
+    log_stderr: true
+    log_stdout: false
+    default_timeout_seconds: 120
+    default_enabled: true
+    block_list: []

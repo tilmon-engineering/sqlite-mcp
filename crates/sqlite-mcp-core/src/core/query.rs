@@ -1,0 +1,272 @@
+use super::{Core, CoreError};
+use crate::core::error::classify_worker_error;
+use crate::sql::{Cell, cell, validate_with_limit};
+use crate::test_support;
+use crate::worker::WorkerError;
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct QueryResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Cell>>,
+    pub rows_returned: usize,
+    pub truncated: bool,
+    pub execution_complete: bool,
+    pub changes: u64,
+}
+fn serialized_selected_payload(result: &QueryResult) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&serde_json::json!({ "columns": &result.columns, "rows": &result.rows }))
+}
+impl Core {
+    pub async fn query(
+        &self,
+        id: &str,
+        sql: &str,
+        params: &[Cell],
+    ) -> Result<QueryResult, CoreError> {
+        self.query_with_ct(id, sql, params, None).await
+    }
+    pub async fn query_with_ct(
+        &self,
+        id: &str,
+        sql: &str,
+        params: &[Cell],
+        ct: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<QueryResult, CoreError> {
+        if sql.len() > self.config.sql_byte_limit {
+            return Err(CoreError::Worker(WorkerError::Message(
+                "SQL exceeds configured byte limit".into(),
+            )));
+        }
+        if params.len() > self.config.parameter_limit {
+            return Err(CoreError::Worker(WorkerError::Message(
+                "too many parameters".into(),
+            )));
+        }
+        let values = validate_with_limit(sql, params, self.config.parameter_limit)
+            .map_err(|e| CoreError::Worker(WorkerError::Message(e)))?;
+        let this = self.clone();
+        let owned_id = id.to_owned();
+        let statement = sql.to_owned();
+        self.coordinate(async move { this.query_admitted(&owned_id, statement, values, ct).await })
+            .await
+    }
+    async fn query_admitted(
+        &self,
+        id: &str,
+        statement: String,
+        values: Vec<rusqlite::types::Value>,
+        ct: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<QueryResult, CoreError> {
+        let (gate, _w) = self.handle_gate(id).await?;
+        let _operation = gate.lock().await;
+        let (expected_version, observed, expired) = {
+            let s = self.inner.lock().await;
+            let (h, _) = s.handles.get(id).ok_or(CoreError::UnknownHandle)?;
+            (h.schema_version, h.schema_observed, h.expired)
+        };
+        if !observed {
+            return Err(CoreError::SchemaRequired);
+        }
+        if expired {
+            return Err(CoreError::TransactionExpired);
+        }
+        let limit = self.config.result_row_limit;
+        let result_byte_limit = self.config.result_byte_limit;
+        let column_limit = self.config.column_limit;
+        let w = self.worker(id).await?;
+        let mutation_signal = w.mutation_seen.clone();
+        let out = w
+            .run_with_optional_token(
+                std::time::Duration::from_millis(self.config.query_timeout_ms),
+                ct,
+                move |c, _ctx| {
+                    if c.is_autocommit() {
+                        return Err(WorkerError::Message("transaction required".into()));
+                    }
+                    let current: i64 = crate::policy::trusted(|| {
+                        c.query_row("PRAGMA schema_version", [], |r| r.get(0))
+                    })?;
+                    if current != expected_version {
+                        return Err(WorkerError::Message("SCHEMA_STALE".into()));
+                    }
+                    // Exactly-one-statement structural validation against the
+                    // real connection BEFORE any execution. Multiple or empty
+                    // input is rejected outright; a Denied here means the
+                    // parser rejected the SQL (e.g. malformed tail), which the
+                    // real prepare below reports precisely inside the
+                    // savepoint, so no prefix can execute first.
+                    match crate::policy::prepare_exact(c, &statement) {
+                        Err(crate::policy::PolicyError::Multiple) => {
+                            return Err(WorkerError::Message(
+                                "multiple SQL statements are not allowed".into(),
+                            ));
+                        }
+                        Err(crate::policy::PolicyError::Empty) => {
+                            return Err(WorkerError::Message("SQL is empty".into()));
+                        }
+                        _ => {}
+                    }
+                    crate::policy::check_stored_body(&statement, &mutation_signal).map_err(
+                        |e| WorkerError::Message(format!("statement is denied by SQL policy: {e}")),
+                    )?;
+                    crate::policy::trusted(|| c.execute_batch("SAVEPOINT agent_stmt"))?;
+                    let result = (|| {
+                        let mut st = c.prepare(&statement)?;
+                        let column_count = st.column_count();
+                        if column_count > column_limit {
+                            return Err(rusqlite::Error::InvalidParameterName(
+                                "column limit exceeded".into(),
+                            ));
+                        }
+                        let columns = (0..column_count)
+                            .map(|i| st.column_name(i).unwrap_or("").to_owned())
+                            .collect();
+                        let mut rows = st.query(rusqlite::params_from_iter(values.iter()))?;
+                        let mut data = Vec::new();
+                        let mut truncated = false;
+                        while let Some(r) = rows.next()? {
+                            test_support::emit(test_support::Event::StepProgress);
+                            let mut row = Vec::new();
+                            for i in 0..r.as_ref().column_count() {
+                                row.push(cell(r.get_ref(i)?));
+                            }
+                            if data.len() < limit {
+                                data.push(row);
+                            } else {
+                                truncated = true;
+                            }
+                        }
+                        drop(rows);
+                        let changes = if st.readonly() { 0 } else { c.changes() };
+                        Ok(QueryResult {
+                            columns,
+                            rows_returned: data.len(),
+                            rows: data,
+                            truncated,
+                            execution_complete: true,
+                            changes,
+                        })
+                    })();
+                    match result {
+                        Ok(x) => {
+                            let payload = serialized_selected_payload(&x)
+                                .map_err(|e| WorkerError::Message(e.to_string()))?;
+                            if payload.len() > result_byte_limit {
+                                let restored = crate::policy::trusted(|| {
+                                    if crate::test_support::take_cleanup_fault(
+                                        crate::operation::CleanupStage::SavepointRestore,
+                                    )
+                                    .is_some()
+                                    {
+                                        return Err(rusqlite::Error::InvalidQuery);
+                                    }
+                                    c.execute_batch("ROLLBACK TO agent_stmt; RELEASE agent_stmt")
+                                });
+                                if restored.is_err() {
+                                    return Err(WorkerError::Message(
+                                        "savepoint restoration failed; handle invalidated".into(),
+                                    ));
+                                }
+                                return Err(WorkerError::ResultTooLarge {
+                                    retained_bytes: payload.len(),
+                                    limit: result_byte_limit,
+                                });
+                            }
+                            crate::policy::trusted(|| c.execute_batch("RELEASE agent_stmt"))?;
+                            serde_json::to_value(x).map_err(|e| WorkerError::Message(e.to_string()))
+                        }
+                        Err(e) => {
+                            if c.is_autocommit() {
+                                return Err(WorkerError::Message(format!(
+                                    "outer transaction aborted: {e}"
+                                )));
+                            }
+                            if crate::policy::trusted(|| {
+                                c.execute_batch("ROLLBACK TO agent_stmt; RELEASE agent_stmt")
+                            })
+                            .is_err()
+                            {
+                                return Err(WorkerError::Message(
+                                    "savepoint restoration failed; handle invalidated".into(),
+                                ));
+                            }
+                            Err(WorkerError::Sqlite(e))
+                        }
+                    }
+                },
+            )
+            .await;
+        let out_ok = out.is_ok();
+        let attempted = w.mutation_seen.take_after_request();
+        let ddl_attempted = w.mutation_seen.take_ddl_after_request();
+        // F-06 invalidation policy: a DDL attempt invalidates regardless of
+        // outcome; a DML attempt invalidates only on success; a failed DML
+        // leaves the handle usable (statement atomicity).
+        if ddl_attempted || (attempted && out_ok) {
+            let mut s = self.inner.lock().await;
+            if let Some((h, _)) = s.handles.get_mut(id) {
+                h.schema_observed = false;
+                h.observation_generation = h.observation_generation.saturating_add(1);
+            }
+        }
+        let out = match out {
+            Ok(v) => v,
+            Err(e) => {
+                if let WorkerError::Interrupted {
+                    transaction_open: false,
+                    ..
+                } = e
+                {
+                    let mut s = self.inner.lock().await;
+                    if let Some((h, _)) = s.handles.get_mut(id) {
+                        h.transaction_id = None;
+                        h.transaction_mode = None;
+                    }
+                }
+                let message = e.to_string();
+                if message.contains("TRANSACTION_EXPIRED") {
+                    // Worker-internal idle expiry: publish the tombstone so
+                    // close/follow-ups see the truthful expired state.
+                    let mut s = self.inner.lock().await;
+                    if let Some((h, _)) = s.handles.get_mut(id) {
+                        h.expired = true;
+                        h.transaction_id = None;
+                        h.transaction_mode = None;
+                    }
+                }
+                if message.contains("handle invalidated") {
+                    // Cleanup could not establish a safe state: drop the
+                    // handle entirely so later calls require reopening.
+                    let w = {
+                        let mut s = self.inner.lock().await;
+                        if let Some(identity_key) = s
+                            .identities
+                            .iter()
+                            .find(|(_, v)| v.as_str() == id)
+                            .map(|(k, _)| *k)
+                        {
+                            s.identities.remove(&identity_key);
+                        }
+                        s.gates.remove(id);
+                        s.handles.remove(id).map(|(_, w)| w)
+                    };
+                    if let Some(w) = w {
+                        // The original "handle invalidated" error below already
+                        // reports the uncertainty; the shutdown status cannot
+                        // improve it further on this path.
+                        let _ = w.shutdown().await;
+                    }
+                }
+                if message.contains("SCHEMA_STALE") {
+                    return Err(CoreError::SchemaStale);
+                }
+                return Err(classify_worker_error(e, true));
+            }
+        };
+        if out == serde_json::json!("SCHEMA_STALE") {
+            return Err(CoreError::SchemaStale);
+        }
+        let result: QueryResult = serde_json::from_value(out)
+            .map_err(|e| CoreError::Worker(WorkerError::Message(e.to_string())))?;
+        Ok(result)
+    }
+}
