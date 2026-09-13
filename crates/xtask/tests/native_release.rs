@@ -118,6 +118,140 @@ fn native_archive_smoke() {
     assert_eq!(String::from_utf8_lossy(&listing.stdout), "sqlite-mcp\n");
 }
 
+fn verified_asset_fixture(prefix: &str) -> (PathBuf, PathBuf) {
+    let dir = temp_dir(prefix);
+    let staging = temp_dir(&format!("{prefix}-staging"));
+    fs::copy(artifact(), staging.join("sqlite-mcp")).unwrap();
+    for target in [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+    ] {
+        let archive = dir.join(format!("sqlite-mcp-{target}.tar.gz"));
+        let out = Command::new("tar")
+            .args([
+                "-czf",
+                archive.to_str().unwrap(),
+                "-C",
+                staging.to_str().unwrap(),
+                "sqlite-mcp",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+    let sums = dir.join("SHA256SUMS");
+    let mut text = String::new();
+    for name in [
+        "sqlite-mcp-x86_64-unknown-linux-gnu.tar.gz",
+        "sqlite-mcp-aarch64-unknown-linux-gnu.tar.gz",
+        "sqlite-mcp-aarch64-apple-darwin.tar.gz",
+        "sqlite-mcp-x86_64-apple-darwin.tar.gz",
+    ] {
+        let out = Command::new("sha256sum")
+            .arg(dir.join(name))
+            .output()
+            .unwrap();
+        let sum = String::from_utf8(out.stdout)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned();
+        text.push_str(&format!("{sum}  {name}\n"));
+    }
+    fs::write(&sums, text).unwrap();
+    (dir, staging.join("sqlite-mcp"))
+}
+
+#[test]
+fn verify_downloads_success_actual_native_binary() {
+    let (dir, binary) = verified_asset_fixture("verify-success");
+    let out = xtask(&[
+        "verify-downloads",
+        "v0.1.0",
+        dir.to_str().unwrap(),
+        binary.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn verify_downloads_corrupt_every_archive_prevents_execution() {
+    for target in [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+    ] {
+        let (dir, _) = verified_asset_fixture("verify-corrupt");
+        fs::write(dir.join(format!("sqlite-mcp-{target}.tar.gz")), b"corrupt").unwrap();
+        let out = xtask(&[
+            "verify-downloads",
+            "v0.1.0",
+            dir.to_str().unwrap(),
+            "/definitely/not-executed",
+        ]);
+        assert!(!out.status.success(), "accepted corrupt {target}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("checksum mismatch"));
+    }
+}
+
+#[test]
+fn verify_downloads_omitting_every_asset_rejected() {
+    for missing in [
+        "sqlite-mcp-x86_64-unknown-linux-gnu.tar.gz",
+        "sqlite-mcp-aarch64-unknown-linux-gnu.tar.gz",
+        "sqlite-mcp-aarch64-apple-darwin.tar.gz",
+        "sqlite-mcp-x86_64-apple-darwin.tar.gz",
+        "SHA256SUMS",
+    ] {
+        let (dir, _) = verified_asset_fixture("verify-omit");
+        fs::remove_file(dir.join(missing)).unwrap();
+        let out = xtask(&[
+            "verify-downloads",
+            "v0.1.0",
+            dir.to_str().unwrap(),
+            "/definitely/not-executed",
+        ]);
+        assert!(!out.status.success(), "accepted missing {missing}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("asset directory"));
+    }
+}
+
+#[test]
+fn verify_downloads_bad_binary() {
+    let (dir, _) = verified_asset_fixture("verify-bad-binary");
+    let bad = temp_dir("verify-bad-binary-file").join("bad");
+    fs::write(&bad, b"not executable").unwrap();
+    let out = xtask(&[
+        "verify-downloads",
+        "v0.1.0",
+        dir.to_str().unwrap(),
+        bad.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not executable"));
+}
+
+#[test]
+fn verify_downloads_wrong_version_rejected() {
+    let (dir, _) = verified_asset_fixture("verify-wrong-version");
+    let out = xtask(&[
+        "verify-downloads",
+        "v9.9.9",
+        dir.to_str().unwrap(),
+        "/missing",
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid release tag"));
+}
+
 #[test]
 fn native_archive_rejects_nonexecutable() {
     let dir = temp_dir("nonexec");

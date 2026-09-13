@@ -48,8 +48,8 @@ jobs:
           version='1.7.12'
           archive="actionlint_${version}_linux_amd64.tar.gz"
           base="https://github.com/rhysd/actionlint/releases/download/v${version}"
-          curl --fail --silent --show-error --location "$base/$archive" --output "$RUNNER_TEMP/$archive"
-          curl --fail --silent --show-error --location "$base/actionlint_${version}_checksums.txt" --output "$RUNNER_TEMP/checksums.txt"
+          curl --disable --proto '=https' --proto-redir '=https' --fail --silent --show-error --location "$base/$archive" --output "$RUNNER_TEMP/$archive"
+          curl --disable --proto '=https' --proto-redir '=https' --fail --silent --show-error --location "$base/actionlint_${version}_checksums.txt" --output "$RUNNER_TEMP/checksums.txt"
           (cd "$RUNNER_TEMP" && grep "  $archive$" checksums.txt | sha256sum --check --status)
           mkdir -p "$RUNNER_TEMP/actionlint/bin"
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/actionlint/bin" --strip-components=1 "actionlint_${version}/actionlint"
@@ -60,15 +60,9 @@ jobs:
           REF_TYPE: ${{ github.ref_type }}
         run: |
           set -euo pipefail
-          if [[ "$REF_TYPE" == tag ]]; then
-            TAG="$REF_NAME"
-          else
-            TAG="$(cargo +"$RUST_TOOLCHAIN" run --locked -q -p xtask -- expected-tag)"
-          fi
+          if [[ "$REF_TYPE" == tag ]]; then TAG="$REF_NAME"; else TAG="$(cargo +"$RUST_TOOLCHAIN" run --locked -q -p xtask -- expected-tag)"; fi
           cargo +"$RUST_TOOLCHAIN" run --locked -p xtask -- release-check "$TAG"
-          if [[ "$REF_TYPE" == tag ]]; then
-            cargo +"$RUST_TOOLCHAIN" run --locked -p xtask -- release-notes "$TAG" release-notes.md
-          fi
+          if [[ "$REF_TYPE" == tag ]]; then cargo +"$RUST_TOOLCHAIN" run --locked -p xtask -- release-notes "$TAG" release-notes.md; fi
           printf 'TAG=%s\n' "$TAG" >> "$GITHUB_ENV"
       - name: Workflow lint
         run: actionlint .github/workflows/release.yml
@@ -90,9 +84,27 @@ jobs:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             arch: x86_64
+            actionlint_suffix: linux_amd64
+            actionlint_checksum: sha256sum
+            actionlint_runner_arch: X64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            actionlint_suffix: linux_arm64
+            actionlint_checksum: sha256sum
+            actionlint_runner_arch: ARM64
           - os: macos-15
             target: aarch64-apple-darwin
             arch: arm64
+            actionlint_suffix: darwin_arm64
+            actionlint_checksum: shasum
+            actionlint_runner_arch: ARM64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+            actionlint_suffix: darwin_amd64
+            actionlint_checksum: shasum
+            actionlint_runner_arch: X64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -117,25 +129,23 @@ jobs:
       - name: Install actionlint
         shell: bash
         env:
-          RUNNER_OS: ${{ runner.os }}
+          ACTIONLINT_SUFFIX: ${{ matrix.actionlint_suffix }}
+          ACTIONLINT_CHECKSUM: ${{ matrix.actionlint_checksum }}
+          ACTIONLINT_RUNNER_ARCH: ${{ matrix.actionlint_runner_arch }}
         run: |
           set -euo pipefail
-          version='1.7.12'
-          case "$RUNNER_OS" in
-            Linux) archive="actionlint_${version}_linux_amd64.tar.gz"; checksum='sha256sum' ;;
-            macOS) archive="actionlint_${version}_darwin_arm64.tar.gz"; checksum='shasum -a 256' ;;
-            *) echo "unsupported runner: $RUNNER_OS" >&2; exit 1 ;;
+          case "${RUNNER_OS}:${ACTIONLINT_RUNNER_ARCH}:${ACTIONLINT_SUFFIX}:${ACTIONLINT_CHECKSUM}" in
+            Linux:X64:linux_amd64:sha256sum|Linux:ARM64:linux_arm64:sha256sum|macOS:ARM64:darwin_arm64:shasum|macOS:X64:darwin_amd64:shasum) ;;
+            *) echo "unsupported actionlint runner tuple" >&2; exit 1 ;;
           esac
+          version='1.7.12'
+          archive="actionlint_${version}_${ACTIONLINT_SUFFIX}.tar.gz"
           base="https://github.com/rhysd/actionlint/releases/download/v${version}"
-          curl --fail --silent --show-error --location "$base/$archive" --output "$RUNNER_TEMP/$archive"
-          curl --fail --silent --show-error --location "$base/actionlint_${version}_checksums.txt" --output "$RUNNER_TEMP/checksums.txt"
+          curl --disable --proto '=https' --proto-redir '=https' --fail --silent --show-error --location "$base/$archive" --output "$RUNNER_TEMP/$archive"
+          curl --disable --proto '=https' --proto-redir '=https' --fail --silent --show-error --location "$base/actionlint_${version}_checksums.txt" --output "$RUNNER_TEMP/checksums.txt"
           expected="$(grep "  $archive$" "$RUNNER_TEMP/checksums.txt")"
           test -n "$expected"
-          if [[ "$checksum" == 'sha256sum' ]]; then
-            printf '%s\n' "$expected" | (cd "$RUNNER_TEMP" && sha256sum --check --status)
-          else
-            printf '%s\n' "$expected" | (cd "$RUNNER_TEMP" && shasum -a 256 --check)
-          fi
+          if [[ "$ACTIONLINT_CHECKSUM" == sha256sum ]]; then printf '%s\n' "$expected" | (cd "$RUNNER_TEMP" && sha256sum --check --status); else printf '%s\n' "$expected" | (cd "$RUNNER_TEMP" && shasum -a 256 --check); fi
           mkdir -p "$RUNNER_TEMP/actionlint/bin"
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/actionlint/bin" --strip-components=1 "actionlint_${version}/actionlint"
           echo "$RUNNER_TEMP/actionlint/bin" >> "$GITHUB_PATH"
@@ -145,11 +155,7 @@ jobs:
           REF_TYPE: ${{ github.ref_type }}
         run: |
           set -euo pipefail
-          if [[ "$REF_TYPE" == tag ]]; then
-            TAG="$REF_NAME"
-          else
-            TAG="$(cargo +"$RUST_TOOLCHAIN" run --locked -q -p xtask -- expected-tag)"
-          fi
+          if [[ "$REF_TYPE" == tag ]]; then TAG="$REF_NAME"; else TAG="$(cargo +"$RUST_TOOLCHAIN" run --locked -q -p xtask -- expected-tag)"; fi
           printf 'TAG=%s\n' "$TAG" >> "$GITHUB_ENV"
       - name: Verify native runner
         env:
@@ -170,6 +176,13 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: cargo +"$RUST_TOOLCHAIN" build --locked --release -p sqlite-mcp --bin sqlite-mcp --target "$TARGET"
+      - name: Inspect built runtime
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_OS}" == Linux ]]; then readelf -h "target/$TARGET/release/sqlite-mcp"; readelf -l "target/$TARGET/release/sqlite-mcp"; else otool -l "target/$TARGET/release/sqlite-mcp"; otool -L "target/$TARGET/release/sqlite-mcp"; fi
+          printf 'runtime_env_defaults=%s\n' "${RUSTFLAGS:-<unset>}"
       - name: Native smoke test
         env:
           TAG: ${{ env.TAG }}
@@ -197,8 +210,7 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    permissions:
-      contents: write
+    permissions: { contents: write }
     steps:
       - name: Checkout tagged commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (node24)
@@ -207,20 +219,29 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.sha }}
       - name: Install Rust
-        shell: bash
         run: |
           set -euo pipefail
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
-      - name: Download Linux artifact
+      - name: Download x86_64 Linux artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1 (node24)
         with:
           name: release-x86_64-unknown-linux-gnu
           path: release-assets
-      - name: Download macOS artifact
+      - name: Download aarch64 Linux artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1 (node24)
+        with:
+          name: release-aarch64-unknown-linux-gnu
+          path: release-assets
+      - name: Download arm64 macOS artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1 (node24)
         with:
           name: release-aarch64-apple-darwin
+          path: release-assets
+      - name: Download x86_64 macOS artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1 (node24)
+        with:
+          name: release-x86_64-apple-darwin
           path: release-assets
       - name: Prepare and publish release
         env:
@@ -229,3 +250,108 @@ jobs:
           ASSET_DIR: release-assets
           GH_TOKEN: ${{ github.token }}
         run: cargo +"$RUST_TOOLCHAIN" run --locked -p xtask -- publish "$TAG" "$EXPECTED_SHA" "$ASSET_DIR"
+
+  verify-published:
+    name: Verify published ${{ matrix.target }}
+    needs: publish
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    permissions: { contents: read }
+    steps:
+      - name: Checkout exact published commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (node24)
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Assert exact published commit
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Install Rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Fetch public release assets
+        env:
+          TAG: ${{ github.ref_name }}
+          ASSET_DIR: ${{ runner.temp }}/sqlite-mcp-assets
+        run: cargo +"$RUST_TOOLCHAIN" run --locked -p xtask -- fetch-public-assets "$TAG" "$ASSET_DIR"
+      - name: Verify archive member and extract freshly
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET_DIR: ${{ runner.temp }}/sqlite-mcp-assets
+          EXTRACT_DIR: ${{ runner.temp }}/sqlite-mcp-extracted
+        run: |
+          set -euo pipefail
+          archive="$ASSET_DIR/sqlite-mcp-$TARGET.tar.gz"
+          test "$(tar -tzf "$archive")" = sqlite-mcp
+          mkdir "$EXTRACT_DIR"
+          tar -xzf "$archive" -C "$EXTRACT_DIR" --no-same-owner
+          test -x "$EXTRACT_DIR/sqlite-mcp"
+      - name: Verify downloaded checksums and run extracted binary
+        env:
+          TAG: ${{ github.ref_name }}
+          ASSET_DIR: ${{ runner.temp }}/sqlite-mcp-assets
+          BINARY_PATH: ${{ runner.temp }}/sqlite-mcp-extracted/sqlite-mcp
+        run: cargo +"$RUST_TOOLCHAIN" run --locked -p xtask -- verify-downloads "$TAG" "$ASSET_DIR" "$BINARY_PATH"
+
+  verify-release-metadata:
+    name: Verify public release metadata
+    needs: publish
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions: { contents: read }
+    steps:
+      - name: Checkout exact published commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (node24)
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Assert exact published commit
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Install Rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Verify public release metadata anonymously
+        env:
+          TAG: ${{ github.ref_name }}
+          EXPECTED_SHA: ${{ github.sha }}
+          EVIDENCE_PATH: ${{ runner.temp }}/public-release-metadata.json
+        run: cargo +"$RUST_TOOLCHAIN" run --locked -p xtask -- verify-public-release "$TAG" "$EXPECTED_SHA" "$EVIDENCE_PATH"
+      - name: Upload public release evidence
+        id: upload-public-evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1 (node24)
+        with:
+          name: release-public-metadata
+          path: ${{ runner.temp }}/public-release-metadata.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Record public evidence URL
+        env:
+          ARTIFACT_URL: ${{ steps.upload-public-evidence.outputs.artifact-url }}
+        run: |
+          set -euo pipefail
+          printf 'Public release metadata evidence: %s\n' "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"

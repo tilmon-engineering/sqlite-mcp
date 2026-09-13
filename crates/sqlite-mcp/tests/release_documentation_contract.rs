@@ -1,5 +1,10 @@
 use std::fs;
 
+fn contains_marker(text: &str, marker: &str) -> bool {
+    text.to_ascii_lowercase()
+        .contains(&marker.to_ascii_lowercase())
+}
+
 fn repository_file(path: &str) -> String {
     let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     fs::read_to_string(repository_root.join(path))
@@ -20,7 +25,7 @@ fn release_documentation_contract() {
             readme.as_str(),
             &[
                 "release",
-                "ubuntu-24.04",
+                "Ubuntu 24.04",
                 "GNU",
                 "unsigned",
                 "Gatekeeper",
@@ -69,4 +74,132 @@ fn release_documentation_contract() {
             );
         }
     }
+
+    let targets = [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+    ];
+    for target in targets {
+        assert!(readme.contains(target), "README is missing target {target}");
+        assert!(
+            readme.contains(&format!(
+                "https://github.com/tilmon-engineering/sqlite-mcp/releases/download/v0.1.0/sqlite-mcp-{target}.tar.gz"
+            )),
+            "README is missing immutable v0.1.0 download link for {target}"
+        );
+        assert!(design.contains(target), "DESIGN is missing target {target}");
+        assert!(
+            skill.contains(target),
+            "release skill is missing target {target}"
+        );
+    }
+
+    for marker in [
+        "uname -s",
+        "uname -m",
+        "VERSION=",
+        "TEMP_INSTALL=",
+        "config.example.toml",
+        "--config",
+        "SHA256SUMS",
+        "sha256sum --check",
+        "shasum -a 256 --check",
+        "CHECKSUM_COUNT=",
+        "test \"$CHECKSUM_COUNT\" -eq 1",
+        "CHECKSUM_ENTRY=",
+        "tar -tzf",
+        "install -m 0755",
+        "--version",
+        "--disable --proto '=https' --proto-redir '=https'",
+        "macOS 15",
+        "Ubuntu 24.04",
+        "GNU/glibc",
+        "unsigned",
+        "unnotarized",
+        "do not disable Gatekeeper globally",
+        "On macOS, use the same `set -euo pipefail`",
+    ] {
+        assert!(
+            contains_marker(&readme, marker),
+            "README is missing installation/platform marker {marker:?}"
+        );
+    }
+    assert!(
+        readme.contains("```bash\nset -euo pipefail"),
+        "README install snippet must enable Bash fail-closed mode"
+    );
+    assert!(
+        !readme.contains("releases/latest"),
+        "README download links must not use mutable latest URLs"
+    );
+    assert!(
+        readme.contains("shasum -a 256 --check"),
+        "README must document the macOS checksum command"
+    );
+    assert!(
+        !readme.contains("pipe") || readme.contains("never pipe"),
+        "README must not present download-to-shell installation"
+    );
+}
+
+#[test]
+fn workflow_documented_commands_contract() {
+    let agents = repository_file("AGENTS.md");
+    let skill = repository_file(".polytoken/skills/release-sqlite-mcp/SKILL.md");
+    let mise = repository_file("mise.toml");
+
+    let xtask_commands = [
+        "release-check TAG",
+        "release-notes TAG OUTPUT_PATH",
+        "verify-public-release TAG EXPECTED_SHA EVIDENCE_PATH",
+        "fetch-public-assets TAG ASSET_DIR",
+        "verify-downloads TAG ASSET_DIR BINARY_PATH",
+    ];
+    for command in xtask_commands {
+        assert!(
+            agents.contains(command),
+            "AGENTS is missing documented command {command:?}"
+        );
+        assert!(
+            skill.contains(command),
+            "release skill is missing documented command {command:?}"
+        );
+    }
+
+    for task in ["release-check", "release-build", "workflow-check"] {
+        assert!(
+            mise.contains(&format!("[tasks.{task}]")),
+            "mise is missing {task}"
+        );
+        assert!(agents.contains(task), "AGENTS is missing mise task {task}");
+        assert!(
+            skill.contains(task),
+            "release skill is missing mise task {task}"
+        );
+    }
+
+    for marker in [
+        "git push origin HEAD:main",
+        "git tag -a \"$TAG\"",
+        "git push origin \"$TAG\"",
+    ] {
+        assert!(
+            skill.contains(marker),
+            "release skill is missing required release command {marker:?}"
+        );
+    }
+    assert!(
+        skill.contains(
+            "Push `main` normally, then wait for successful branch CI at that exact final notes SHA"
+        ) && skill.contains(
+            "Only after that gate succeeds, create an annotated `v{version}` tag at the exact tested SHA"
+        ) && skill.contains("push only that exact tag"),
+        "release prose must order push-main, successful exact-SHA branch CI, tag creation, tag push"
+    );
+    assert!(
+        skill.contains("publishedAt") && skill.contains("isDraft"),
+        "release skill must use current publication metadata fields"
+    );
 }

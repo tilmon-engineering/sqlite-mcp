@@ -174,6 +174,57 @@ fn notes_exact_section() {
 }
 
 #[test]
+fn public_release_metadata_http_failure() {
+    let root = fixture("public-http-failure", "0.7.3", &valid_changelog("0.7.3"));
+    let evidence = root.join("evidence.json");
+    assert_failed_with(
+        &root,
+        &[
+            "verify-public-release",
+            "v0.7.3",
+            "not-a-sha",
+            evidence.to_str().unwrap(),
+        ],
+        "full hexadecimal",
+    );
+    assert!(!evidence.exists());
+}
+
+#[test]
+fn public_release_metadata_rejects_invalid_tag_without_http() {
+    let root = fixture("public-mismatch", "0.7.3", &valid_changelog("0.7.3"));
+    let evidence = root.join("evidence.json");
+    assert_failed_with(
+        &root,
+        &[
+            "verify-public-release",
+            "v0.7.4",
+            &"a".repeat(40),
+            evidence.to_str().unwrap(),
+        ],
+        "invalid release tag",
+    );
+    assert!(!evidence.exists());
+}
+
+#[test]
+fn verify_downloads_missing_asset() {
+    let root = fixture("verify-missing", "0.7.3", &valid_changelog("0.7.3"));
+    let assets = root.join("assets");
+    fs::create_dir_all(&assets).unwrap();
+    assert_failed_with(
+        &root,
+        &[
+            "verify-downloads",
+            "v0.7.3",
+            assets.to_str().unwrap(),
+            "missing",
+        ],
+        "asset directory",
+    );
+}
+
+#[test]
 fn notes_invalid_fenced_and_no_output() {
     let cases = [
         ("invalid", "not a changelog\n", "changelog must begin"),

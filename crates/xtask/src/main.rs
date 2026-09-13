@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
     io::{BufRead, BufReader, Read, Write},
@@ -301,10 +301,12 @@ pub fn release_notes(root: &Path, tag: &str) -> Result<String, String> {
     extract_notes(&text, &meta.version)
 }
 
-pub fn archive_names() -> [&'static str; 2] {
+pub fn archive_names() -> [&'static str; 4] {
     [
         "sqlite-mcp-x86_64-unknown-linux-gnu.tar.gz",
+        "sqlite-mcp-aarch64-unknown-linux-gnu.tar.gz",
         "sqlite-mcp-aarch64-apple-darwin.tar.gz",
+        "sqlite-mcp-x86_64-apple-darwin.tar.gz",
     ]
 }
 
@@ -332,6 +334,9 @@ pub trait CommandRunner {
         args: &[String],
         dir: Option<&Path>,
     ) -> Result<CommandOutput, String>;
+    fn sleep(&mut self, duration: Duration) {
+        thread::sleep(duration);
+    }
 }
 
 pub struct ProcessRunner;
@@ -454,7 +459,7 @@ fn exact_names(actual: &[String]) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn publish_release<R: CommandRunner>(
+fn publish_release<R: CommandRunner>(
     runner: &mut R,
     root: &Path,
     tag: &str,
@@ -896,13 +901,13 @@ fn verify_asset_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
         .collect();
     let archive_expected: Vec<String> = expected.iter().map(|x| (*x).to_owned()).collect();
     if !exact_membership(&actual_names, &archive_expected) {
-        return Err("asset directory must contain exactly the two archives".into());
+        return Err("asset directory must contain exactly the four archives".into());
     }
     let mut expected_files: Vec<_> = expected.iter().map(std::ffi::OsString::from).collect();
     expected_files.push(std::ffi::OsString::from("SHA256SUMS"));
     expected_files.sort();
     if actual != expected_files {
-        return Err("asset directory must contain exactly the two archives and SHA256SUMS".into());
+        return Err("asset directory must contain exactly the four archives and SHA256SUMS".into());
     }
     let mut assets = Vec::new();
     for n in expected {
@@ -927,10 +932,261 @@ fn verify_asset_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
     }
     Ok(assets)
 }
+
+const PUBLIC_REPO: &str = "tilmon-engineering/sqlite-mcp";
+const PUBLIC_API: &str = "https://api.github.com";
+
+fn valid_sha(value: &str) -> bool {
+    value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Execute one anonymous, bounded curl request, writing the response body to `dest`.
+/// Only transient GitHub visibility statuses are retried (at most five attempts).
+pub fn anonymous_http_get<R: CommandRunner>(
+    runner: &mut R,
+    url: &str,
+    dest: &Path,
+) -> Result<(), String> {
+    if !url.starts_with("https://") || url.contains(" ") {
+        return Err("public URL must be an HTTPS URL".into());
+    }
+    let output_path = dest.to_str().ok_or("non-utf8 HTTP output path")?;
+    let mut last = String::new();
+    for attempt in 0..5 {
+        let args = vec![
+            arg("--disable"),
+            arg("--proto"),
+            arg("=https"),
+            arg("--proto-redir"),
+            arg("=https"),
+            arg("--location"),
+            arg("--silent"),
+            arg("--show-error"),
+            arg("--connect-timeout"),
+            arg("10"),
+            arg("--max-time"),
+            arg("30"),
+            arg("--output"),
+            arg(output_path),
+            arg("--write-out"),
+            arg("%{http_code}"),
+            arg(url),
+        ];
+        let output = match runner.run("curl", &args, None) {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = fs::remove_file(dest);
+                return Err(format!("anonymous HTTP request failed: {error}"));
+            }
+        };
+        let status = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if output.code == Some(0) && status.len() == 3 && status.starts_with('2') {
+            return Ok(());
+        }
+        let retryable = matches!(status.as_str(), "404" | "502" | "503" | "504");
+        last = if status.is_empty() {
+            String::from_utf8_lossy(&output.stderr).trim().to_string()
+        } else {
+            format!("HTTP {status}")
+        };
+        let _ = fs::remove_file(dest);
+        if !retryable || attempt == 4 {
+            return Err(format!("anonymous HTTP request failed: {last}"));
+        }
+        runner.sleep(Duration::from_secs(2));
+    }
+    Err(format!("anonymous HTTP request failed: {last}"))
+}
+
+pub fn fetch_public_assets<R: CommandRunner>(
+    runner: &mut R,
+    tag: &str,
+    dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let version = tag.strip_prefix('v').ok_or("invalid release tag")?;
+    validate_tag(tag, version)?;
+    if dir.exists()
+        && fs::read_dir(dir)
+            .map_err(|e| e.to_string())?
+            .next()
+            .is_some()
+    {
+        return Err("asset destination must be empty".into());
+    }
+    fs::create_dir_all(dir).map_err(|e| format!("create asset destination: {e}"))?;
+    let result = (|| {
+        for name in release_names() {
+            let url = format!("https://github.com/{PUBLIC_REPO}/releases/download/{tag}/{name}");
+            anonymous_http_get(runner, &url, &dir.join(&name))?;
+        }
+        verify_asset_dir(dir)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(dir);
+    }
+    result
+}
+
+pub fn verify_downloads(root: &Path, tag: &str, dir: &Path, binary: &Path) -> Result<(), String> {
+    let meta = validate_repository(root, tag)?;
+    let _assets = verify_asset_dir(dir)?;
+    verify_binary(root, binary, &meta.version)
+}
+
+#[derive(Debug, Serialize)]
+struct PublicEvidence {
+    tag: String,
+    expected_sha: String,
+    release_url: String,
+    asset_urls: Vec<String>,
+    assertions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PublicRelease {
+    #[serde(rename = "tag_name")]
+    tag: String,
+    draft: bool,
+    prerelease: bool,
+    published_at: Option<String>,
+    body: String,
+    assets: Vec<PublicAsset>,
+}
+#[derive(Debug, Deserialize)]
+struct PublicAsset {
+    name: String,
+    browser_download_url: String,
+    size: u64,
+}
+#[derive(Debug, Deserialize)]
+struct GitRef {
+    object: GitObject,
+}
+#[derive(Debug, Deserialize)]
+struct AnnotatedTag {
+    name: String,
+    object: GitObject,
+}
+#[derive(Debug, Deserialize)]
+struct GitObject {
+    sha: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+pub fn verify_public_release<R: CommandRunner>(
+    runner: &mut R,
+    root: &Path,
+    tag: &str,
+    expected_sha: &str,
+    evidence: &Path,
+) -> Result<(), String> {
+    let meta = validate_repository(root, tag)?;
+    if !valid_sha(expected_sha) {
+        return Err("EXPECTED_SHA must be a full hexadecimal commit SHA".into());
+    }
+    let temp = root.join("target").join(format!(
+        ".xtask-public-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| format!("clock before Unix epoch: {e}"))?
+            .as_nanos()
+    ));
+    if temp.exists() {
+        return Err("public verification temporary directory exists".into());
+    }
+    fs::create_dir_all(&temp).map_err(|e| e.to_string())?;
+    let result = (|| {
+        let get = |runner: &mut R, path: &str, file: &str| -> Result<Vec<u8>, String> {
+            let p = temp.join(file);
+            anonymous_http_get(runner, &format!("{PUBLIC_API}{path}"), &p)?;
+            fs::read(p).map_err(|e| e.to_string())
+        };
+        let release: PublicRelease = serde_json::from_slice(&get(
+            runner,
+            &format!("/repos/{PUBLIC_REPO}/releases/tags/{tag}"),
+            "release.json",
+        )?)
+        .map_err(|e| format!("decode public release: {e}"))?;
+        if release.tag != tag
+            || release.draft
+            || release.prerelease
+            || release.published_at.is_none()
+            || release.body != release_notes(root, tag)?
+        {
+            return Err("public release metadata mismatch".into());
+        }
+        let expected = release_names();
+        if release.assets.len() != expected.len()
+            || release.assets.iter().any(|a| {
+                a.size == 0
+                    || !expected.contains(&a.name)
+                    || a.browser_download_url
+                        != format!(
+                            "https://github.com/{PUBLIC_REPO}/releases/download/{tag}/{}",
+                            a.name
+                        )
+            })
+            || !exact_membership(
+                &release
+                    .assets
+                    .iter()
+                    .map(|a| a.name.clone())
+                    .collect::<Vec<_>>(),
+                &expected,
+            )
+        {
+            return Err("public release assets mismatch".into());
+        }
+        let reference: GitRef = serde_json::from_slice(&get(
+            runner,
+            &format!("/repos/{PUBLIC_REPO}/git/ref/tags/{tag}"),
+            "ref.json",
+        )?)
+        .map_err(|e| format!("decode tag ref: {e}"))?;
+        if reference.object.kind != "tag" {
+            return Err("tag is not annotated".into());
+        }
+        let annotated: AnnotatedTag = serde_json::from_slice(&get(
+            runner,
+            &format!("/repos/{PUBLIC_REPO}/git/tags/{}", reference.object.sha),
+            "tag.json",
+        )?)
+        .map_err(|e| format!("decode annotated tag: {e}"))?;
+        if annotated.name != tag {
+            return Err("annotated tag name mismatch".into());
+        }
+        if annotated.object.kind != "commit" || annotated.object.sha != expected_sha {
+            return Err("annotated tag does not resolve to expected SHA".into());
+        }
+        let asset_urls = release
+            .assets
+            .iter()
+            .map(|a| a.browser_download_url.clone())
+            .collect();
+        let out = PublicEvidence {
+            tag: tag.into(),
+            expected_sha: expected_sha.into(),
+            release_url: format!("https://github.com/{PUBLIC_REPO}/releases/tag/{tag}"),
+            asset_urls,
+            assertions: vec![
+                "release metadata".into(),
+                "annotated tag peel".into(),
+                "exact assets".into(),
+                format!("workspace version {}", meta.version),
+            ],
+        };
+        let text = serde_json::to_vec_pretty(&out).map_err(|e| e.to_string())?;
+        fs::write(evidence, text).map_err(|e| format!("write evidence: {e}"))
+    })();
+    let _ = fs::remove_dir_all(temp);
+    result
+}
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let action = args.next().ok_or(
-        "usage: xtask <release-check|release-notes|expected-tag|native-smoke|package|publish> ...",
+        "usage: xtask <release-check|release-notes|expected-tag|native-smoke|package|publish|fetch-public-assets|verify-downloads|verify-public-release> ...",
     )?;
     let root = env::current_dir().map_err(|e| e.to_string())?;
     match action.as_str() {
@@ -980,6 +1236,36 @@ fn run() -> Result<(), String> {
             verify_binary(&root, &binary, &meta.version)?;
             let archive = package_binary(&root, &tag, &target, &binary, &outdir)?;
             println!("{}", archive.display());
+        }
+        "fetch-public-assets" => {
+            let tag = args.next().ok_or("fetch-public-assets requires TAG")?;
+            let dir = PathBuf::from(
+                args.next()
+                    .ok_or("fetch-public-assets requires ASSET_DIR")?,
+            );
+            let mut runner = ProcessRunner;
+            fetch_public_assets(&mut runner, &tag, &dir)?;
+            println!("fetched public assets for {tag}");
+        }
+        "verify-downloads" => {
+            let tag = args.next().ok_or("verify-downloads requires TAG")?;
+            let dir = PathBuf::from(args.next().ok_or("verify-downloads requires ASSET_DIR")?);
+            let binary = PathBuf::from(args.next().ok_or("verify-downloads requires BINARY_PATH")?);
+            verify_downloads(&root, &tag, &dir, &binary)?;
+            println!("download verification passed for {tag}");
+        }
+        "verify-public-release" => {
+            let tag = args.next().ok_or("verify-public-release requires TAG")?;
+            let sha = args
+                .next()
+                .ok_or("verify-public-release requires EXPECTED_SHA")?;
+            let evidence = PathBuf::from(
+                args.next()
+                    .ok_or("verify-public-release requires EVIDENCE_PATH")?,
+            );
+            let mut runner = ProcessRunner;
+            verify_public_release(&mut runner, &root, &tag, &sha, &evidence)?;
+            println!("public release verification passed for {tag}");
         }
         "publish" => {
             let tag = args.next().ok_or("publish requires TAG")?;
@@ -1064,7 +1350,11 @@ mod tests {
     #[test]
     fn checksum_exact_membership() {
         let a = archive_names();
-        let good = format!("{:064x}  {}\n{:064x}  {}\n", 1, a[0], 2, a[1]);
+        let good = a
+            .iter()
+            .enumerate()
+            .map(|(i, name)| format!("{:064x}  {name}\n", i + 1))
+            .collect::<String>();
         assert!(verify_checksums(&good, &a).is_ok());
         assert!(verify_checksums(&format!("{:064x}  {}\n", 1, a[0]), &a).is_err());
     }
@@ -1102,6 +1392,8 @@ mod tests {
         postcreate_mismatch: bool,
         publish_called: bool,
         query_count: usize,
+        public_responses: Vec<String>,
+        public_http_failure: bool,
     }
     impl CommandRunner for FakeRunner {
         fn run(
@@ -1126,6 +1418,22 @@ mod tests {
             }
             if program == "gh" && args.starts_with(&[arg("repo"), arg("view")]) {
                 return Ok(output(0, "o/r\n", ""));
+            }
+            if program == "curl" {
+                let output_path = args
+                    .windows(2)
+                    .find(|pair| pair[0] == "--output")
+                    .map(|pair| PathBuf::from(&pair[1]))
+                    .ok_or_else(|| "fake curl missing output path".to_string())?;
+                if self.public_http_failure {
+                    return Ok(output(1, "", "HTTP/1.1 500 Internal Server Error"));
+                }
+                let body = self.public_responses.first().cloned().unwrap_or_default();
+                if !self.public_responses.is_empty() {
+                    self.public_responses.remove(0);
+                }
+                fs::write(output_path, body).map_err(|e| e.to_string())?;
+                return Ok(output(0, "200", ""));
             }
             if program == "gh" && args.first().map(String::as_str) == Some("api") {
                 self.query_count += 1;
@@ -1200,10 +1508,16 @@ mod tests {
         }
     }
     fn release_json(draft: bool, target: &str, body: &str) -> String {
+        let assets = archive_names()
+            .iter()
+            .map(|name| format!(r#"{{"name":"{name}","size":1}}"#))
+            .chain(std::iter::once(
+                r#"{"name":"SHA256SUMS","size":1}"#.to_owned(),
+            ))
+            .collect::<Vec<_>>()
+            .join(",");
         format!(
-            r#"{{"isDraft":{draft},"isPrerelease":false,"tagName":"v1.0.0","targetCommitish":"{target}","body":"{body}","assets":[{{"name":"{}","size":1}},{{"name":"{}","size":1}},{{"name":"SHA256SUMS","size":1}}]}}"#,
-            archive_names()[0],
-            archive_names()[1]
+            r#"{{"isDraft":{draft},"isPrerelease":false,"tagName":"v1.0.0","targetCommitish":"{target}","body":"{body}","assets":[{assets}]}}"#
         )
     }
     fn run_publish(
@@ -1454,5 +1768,366 @@ mod tests {
             .is_err()
         );
         assert!(!fake.publish_called);
+    }
+
+    #[test]
+    fn four_platform_asset_inventory() {
+        assert_eq!(
+            archive_names(),
+            [
+                "sqlite-mcp-x86_64-unknown-linux-gnu.tar.gz",
+                "sqlite-mcp-aarch64-unknown-linux-gnu.tar.gz",
+                "sqlite-mcp-aarch64-apple-darwin.tar.gz",
+                "sqlite-mcp-x86_64-apple-darwin.tar.gz",
+            ]
+        );
+    }
+
+    #[test]
+    fn asset_set_rejects_each_missing_archive() {
+        let root = tempfile_dir();
+        for missing in archive_names() {
+            let dir = root.join(missing.replace('.', "-"));
+            fs::create_dir_all(&dir).unwrap();
+            for name in archive_names().iter().filter(|name| **name != missing) {
+                fs::write(dir.join(name), b"x").unwrap();
+            }
+            let sums = dir.join("SHA256SUMS");
+            fs::write(&sums, "").unwrap();
+            assert!(
+                verify_asset_dir(&dir).is_err(),
+                "accepted missing {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn asset_set_rejects_extra_archive() {
+        let root = tempfile_dir();
+        let dir = root.join("extra");
+        fs::create_dir_all(&dir).unwrap();
+        for name in archive_names() {
+            fs::write(dir.join(name), b"x").unwrap();
+        }
+        fs::write(dir.join("extra.tar.gz"), b"x").unwrap();
+        fs::write(dir.join("SHA256SUMS"), b"").unwrap();
+        assert!(verify_asset_dir(&dir).is_err());
+    }
+
+    #[test]
+    fn checksum_duplicate_and_omit_rejected() {
+        let names = archive_names();
+        let duplicate = format!("{:064x}  {}\n{:064x}  {}\n", 1, names[0], 2, names[0]);
+        assert!(verify_checksums(&duplicate, &names).is_err());
+        let omitted = names[..3]
+            .iter()
+            .map(|n| format!("{:064x}  {n}\n", 1))
+            .collect::<String>();
+        assert!(verify_checksums(&omitted, &names).is_err());
+    }
+
+    #[derive(Default)]
+    struct HttpFake {
+        calls: Vec<Vec<String>>,
+        statuses: Vec<String>,
+        bodies: Vec<Vec<u8>>,
+        sleeps: Vec<Duration>,
+        error: Option<String>,
+    }
+    impl CommandRunner for HttpFake {
+        fn run(
+            &mut self,
+            program: &str,
+            args: &[String],
+            _: Option<&Path>,
+        ) -> Result<CommandOutput, String> {
+            assert_eq!(program, "curl");
+            self.calls.push(args.to_vec());
+            if let Some(error) = self.error.take() {
+                if let Some(path) = args
+                    .windows(2)
+                    .find(|pair| pair[0] == "--output")
+                    .map(|pair| PathBuf::from(&pair[1]))
+                {
+                    fs::write(path, b"partial").unwrap();
+                }
+                return Err(error);
+            }
+            let status = self
+                .statuses
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "200".into());
+            if !self.statuses.is_empty() {
+                self.statuses.remove(0);
+            }
+            if let Some(path) = args
+                .windows(2)
+                .find(|pair| pair[0] == "--output")
+                .map(|pair| PathBuf::from(&pair[1]))
+            {
+                let body = if self.bodies.is_empty() {
+                    Vec::new()
+                } else {
+                    self.bodies.remove(0)
+                };
+                fs::write(path, body).unwrap();
+            }
+            Ok(output(0, &status, ""))
+        }
+        fn sleep(&mut self, duration: Duration) {
+            self.sleeps.push(duration);
+        }
+    }
+
+    #[test]
+    fn public_http_request_contract() {
+        let mut fake = HttpFake {
+            statuses: vec!["200".into()],
+            ..Default::default()
+        };
+        let path = tempfile_dir().join("body");
+        fs::write(&path, b"old").unwrap();
+        anonymous_http_get(&mut fake, "https://example.invalid/a", &path).unwrap();
+        let args = &fake.calls[0];
+        assert!(args.windows(2).any(|x| x == ["--proto", "=https"]));
+        assert!(args.windows(2).any(|x| x == ["--proto-redir", "=https"]));
+        assert!(args.windows(2).any(|x| x == ["--connect-timeout", "10"]));
+        assert!(args.windows(2).any(|x| x == ["--max-time", "30"]));
+        assert!(
+            !args
+                .iter()
+                .any(|x| x.contains("TOKEN") || x.contains("Authorization"))
+        );
+    }
+
+    #[test]
+    fn public_http_retry_policy() {
+        let mut fake = HttpFake {
+            statuses: vec![
+                "404".into(),
+                "502".into(),
+                "503".into(),
+                "504".into(),
+                "200".into(),
+            ],
+            ..Default::default()
+        };
+        let path = tempfile_dir().join("body");
+        anonymous_http_get(&mut fake, "https://example.invalid/a", &path).unwrap();
+        assert_eq!(fake.calls.len(), 5);
+        assert_eq!(fake.sleeps, vec![Duration::from_secs(2); 4]);
+        let mut fail = HttpFake {
+            statuses: vec!["400".into()],
+            ..Default::default()
+        };
+        assert!(anonymous_http_get(&mut fail, "https://example.invalid/a", &path).is_err());
+        assert!(fail.sleeps.is_empty());
+    }
+
+    #[test]
+    fn public_http_runner_error_removes_partial_output() {
+        let root = tempfile_dir();
+        let path = root.join("partial");
+        let mut fake = HttpFake {
+            error: Some("runner failed".into()),
+            ..Default::default()
+        };
+        assert!(anonymous_http_get(&mut fake, "https://example.invalid/a", &path).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn public_http_rejects_downgrade_url() {
+        let mut fake = HttpFake::default();
+        let path = tempfile_dir().join("body");
+        assert!(anonymous_http_get(&mut fake, "http://example.invalid/a", &path).is_err());
+    }
+
+    fn public_fixture(root: &Path, tag: &str, sha: &str) -> Vec<String> {
+        let notes = release_notes(root, tag).unwrap();
+        let assets = release_names()
+            .iter()
+            .map(|name| serde_json::json!({
+                "name": name,
+                "browser_download_url": format!("https://github.com/{PUBLIC_REPO}/releases/download/{tag}/{name}"),
+                "size": 1
+            }))
+            .collect::<Vec<_>>();
+        vec![
+            serde_json::json!({"tag_name": tag, "draft": false, "prerelease": false, "published_at": "2026-01-02T00:00:00Z", "body": notes, "assets": assets}).to_string(),
+            serde_json::json!({"object": {"sha": "tag-object", "type": "tag"}}).to_string(),
+            serde_json::json!({"name": tag, "object": {"sha": sha, "type": "commit"}}).to_string(),
+        ]
+    }
+
+    #[test]
+    fn public_release_metadata_success_records_evidence() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let evidence = tempfile_dir().join("evidence.json");
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let mut fake = FakeRunner {
+            public_responses: public_fixture(&root, "v0.1.0", sha),
+            ..Default::default()
+        };
+        verify_public_release(&mut fake, &root, "v0.1.0", sha, &evidence).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(evidence).unwrap()).unwrap();
+        assert_eq!(value["tag"], "v0.1.0");
+        assert_eq!(value["expected_sha"], sha);
+        assert_eq!(
+            value["release_url"],
+            "https://github.com/tilmon-engineering/sqlite-mcp/releases/tag/v0.1.0"
+        );
+        let urls = value["asset_urls"].as_array().unwrap();
+        assert_eq!(urls.len(), release_names().len());
+        for (url, name) in urls.iter().zip(release_names()) {
+            assert_eq!(
+                url,
+                &format!("https://github.com/{PUBLIC_REPO}/releases/download/v0.1.0/{name}")
+            );
+        }
+        let assertions = value["assertions"].as_array().unwrap();
+        assert!(assertions.iter().any(|v| v == "release metadata"));
+        assert!(assertions.iter().any(|v| v == "annotated tag peel"));
+        assert!(assertions.iter().any(|v| v == "exact assets"));
+        assert!(assertions.iter().any(|v| v == "workspace version 0.1.0"));
+    }
+
+    #[test]
+    fn public_release_metadata_rejects_mismatch() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let cases = [
+            "wrong_sha",
+            "wrong_tag_name",
+            "missing_tag_name",
+            "wrong_tag_object_type",
+            "wrong_tag_object_sha",
+            "missing_release_body",
+            "missing_annotated_object",
+            "lightweight",
+            "tag_name",
+            "body",
+            "draft",
+            "prerelease",
+            "unpublished",
+            "missing_asset",
+            "extra_asset",
+            "empty_asset",
+            "wrong_url",
+            "malformed",
+        ];
+        for case in cases {
+            let mut responses = public_fixture(&root, "v0.1.0", sha);
+            let mut release: serde_json::Value = serde_json::from_str(&responses[0]).unwrap();
+            match case {
+                "wrong_sha" => responses[2] = serde_json::json!({"name":"v0.1.0","object":{"sha":"ffffffffffffffffffffffffffffffffffffffff","type":"commit"}}).to_string(),
+                "wrong_tag_name" => responses[2] = serde_json::json!({"name":"v9.9.9","object":{"sha":sha,"type":"commit"}}).to_string(),
+                "missing_tag_name" => responses[2] = serde_json::json!({"object":{"sha":sha,"type":"commit"}}).to_string(),
+                "wrong_tag_object_type" => responses[2] = serde_json::json!({"name":"v1.0.0","object":{"sha":sha,"type":"tree"}}).to_string(),
+                "wrong_tag_object_sha" => responses[1] = serde_json::json!({"object":{"type":"tag"}}).to_string(),
+                "missing_release_body" => { release.as_object_mut().unwrap().remove("body"); },
+                "missing_annotated_object" => responses[2] = serde_json::json!({"name":"v0.1.0"}).to_string(),
+                "lightweight" => responses[1] = serde_json::json!({"object":{"sha":sha,"type":"commit"}}).to_string(),
+                "tag_name" => release["tag_name"] = serde_json::json!("v9.9.9"),
+                "body" => release["body"] = serde_json::json!("wrong"),
+                "draft" => release["draft"] = serde_json::json!(true),
+                "prerelease" => release["prerelease"] = serde_json::json!(true),
+                "unpublished" => release["published_at"] = serde_json::Value::Null,
+                "missing_asset" => { release["assets"].as_array_mut().unwrap().pop(); },
+                "extra_asset" => release["assets"].as_array_mut().unwrap().push(serde_json::json!({"name":"extra","browser_download_url":"x","size":1})),
+                "empty_asset" => release["assets"][0]["size"] = serde_json::json!(0),
+                "wrong_url" => release["assets"][0]["browser_download_url"] = serde_json::json!("https://wrong.invalid"),
+                "malformed" => responses[0] = "{".into(),
+                _ => unreachable!(),
+            }
+            if case != "malformed" {
+                responses[0] = release.to_string();
+            }
+            let evidence = tempfile_dir().join("must-not-exist.json");
+            let mut fake = FakeRunner {
+                public_responses: responses,
+                ..Default::default()
+            };
+            assert!(
+                verify_public_release(&mut fake, &root, "v0.1.0", sha, &evidence).is_err(),
+                "accepted {case}"
+            );
+            assert!(!evidence.exists(), "wrote evidence for {case}");
+        }
+    }
+
+    #[test]
+    fn public_release_metadata_http_failure() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let evidence = tempfile_dir().join("must-not-exist.json");
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let mut fake = FakeRunner {
+            public_http_failure: true,
+            ..Default::default()
+        };
+        assert!(verify_public_release(&mut fake, &root, "v0.1.0", sha, &evidence).is_err());
+        assert!(!evidence.exists());
+    }
+
+    #[test]
+    fn fetch_public_assets_exact_inventory() {
+        let root = tempfile_dir();
+        let dir = root.join("assets");
+        let payloads: Vec<Vec<u8>> = archive_names()
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("archive-{i}").into_bytes())
+            .collect();
+        let mut bodies = payloads.clone();
+        let sums = archive_names()
+            .iter()
+            .zip(&payloads)
+            .map(|(name, body)| {
+                let p = root.join(name);
+                fs::write(&p, body).unwrap();
+                format!("{}  {name}\n", sha256(&p).unwrap())
+            })
+            .collect::<String>();
+        bodies.push(sums.into_bytes());
+        let mut fake = HttpFake {
+            bodies,
+            ..Default::default()
+        };
+        let assets = fetch_public_assets(&mut fake, "v0.1.0", &dir).unwrap();
+        assert_eq!(assets.len(), archive_names().len());
+        assert_eq!(fs::read_dir(dir).unwrap().count(), release_names().len());
+    }
+
+    #[test]
+    fn fetch_public_assets_failure_no_success() {
+        let root = tempfile_dir();
+        let dir = root.join("assets");
+        let mut fake = HttpFake {
+            statuses: vec!["500".into()],
+            ..Default::default()
+        };
+        assert!(fetch_public_assets(&mut fake, "v0.1.0", &dir).is_err());
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn fetch_public_assets_rejects_invalid_tag_without_http() {
+        let root = tempfile_dir();
+        let dir = root.join("assets");
+        let mut fake = HttpFake::default();
+        assert!(fetch_public_assets(&mut fake, "v1.0.0/../../evil", &dir).is_err());
+        assert!(fake.calls.is_empty());
+        assert!(!dir.exists());
     }
 }

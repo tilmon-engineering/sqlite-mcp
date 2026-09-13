@@ -103,9 +103,42 @@ See [`DESIGN.md`](DESIGN.md) for the normative contract, state machine, error se
 
 ## Release downloads and versioning
 
-Release binaries are built natively for `x86_64-unknown-linux-gnu` on **ubuntu-24.04** and `aarch64-apple-darwin` on an arm64 macOS runner. The Linux GNU binary carries the ubuntu-24.04 runner's glibc compatibility baseline; it is not a musl/static universal Linux build. The macOS binary is unsigned and unnotarized, so macOS Gatekeeper may require user approval and frictionless installation is not promised. Archives contain the `sqlite-mcp` executable and releases include `SHA256SUMS`.
+Published releases provide exactly these four native archives and `SHA256SUMS` (the archive names are version-independent within the versioned release URL):
 
-The compiled workspace Cargo version is the source of truth for the app and core crate. A release tag must be exactly `v{workspace version}`. Release notes are extracted from the matching changelog section only. Follow the [`release-sqlite-mcp` skill](.polytoken/skills/release-sqlite-mcp/SKILL.md) for the two-commit history sequence, prior published ancestor baseline, branch CI gate, immutable annotated tag, and draft recovery rules.
+| Host selection | Rust target | Download |
+|---|---|---|
+| `uname -s` = `Linux`, `uname -m` = `x86_64` | `x86_64-unknown-linux-gnu` | [`sqlite-mcp-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/tilmon-engineering/sqlite-mcp/releases/download/v0.1.0/sqlite-mcp-x86_64-unknown-linux-gnu.tar.gz) |
+| `uname -s` = `Linux`, `uname -m` = `aarch64` | `aarch64-unknown-linux-gnu` | [`sqlite-mcp-aarch64-unknown-linux-gnu.tar.gz`](https://github.com/tilmon-engineering/sqlite-mcp/releases/download/v0.1.0/sqlite-mcp-aarch64-unknown-linux-gnu.tar.gz) |
+| `uname -s` = `Darwin`, `uname -m` = `arm64` | `aarch64-apple-darwin` | [`sqlite-mcp-aarch64-apple-darwin.tar.gz`](https://github.com/tilmon-engineering/sqlite-mcp/releases/download/v0.1.0/sqlite-mcp-aarch64-apple-darwin.tar.gz) |
+| `uname -s` = `Darwin`, `uname -m` = `x86_64` | `x86_64-apple-darwin` | [`sqlite-mcp-x86_64-apple-darwin.tar.gz`](https://github.com/tilmon-engineering/sqlite-mcp/releases/download/v0.1.0/sqlite-mcp-x86_64-apple-darwin.tar.gz) |
+
+Select by both `uname -s` and `uname -m`; do not infer a target from one value. Linux artifacts are built on Ubuntu 24.04 with GNU/glibc and are not musl/static builds or promises of compatibility with older distributions. macOS artifacts are tested on macOS 15, unsigned, and unnotarized. Gatekeeper may require explicit user approval; do not disable Gatekeeper globally, and no frictionless installation or older-macOS support is promised.
+
+For a specific `VERSION` (for example, `0.1.0`), download anonymously into a fresh directory, verify the named checksum entry, verify the archive contains only `sqlite-mcp`, and install under a configurable prefix. These commands never pipe downloaded content to a shell:
+
+```bash
+set -euo pipefail
+VERSION="0.1.0"
+TEMP_INSTALL="${TMPDIR:-/tmp}/sqlite-mcp-install-${VERSION}"
+mkdir -p "$TEMP_INSTALL/download" "$TEMP_INSTALL/bin"
+cd "$TEMP_INSTALL/download"
+BASE="https://github.com/tilmon-engineering/sqlite-mcp/releases/download/v${VERSION}"
+ASSET="sqlite-mcp-x86_64-unknown-linux-gnu.tar.gz" # select from the table above
+curl --disable --proto '=https' --proto-redir '=https' --fail --location --silent --show-error --output "$ASSET" "$BASE/$ASSET"
+curl --disable --proto '=https' --proto-redir '=https' --fail --location --silent --show-error --output SHA256SUMS "$BASE/SHA256SUMS"
+CHECKSUM_COUNT="$(awk -v asset="$ASSET" '$2 == asset { count++ } END { print count + 0 }' SHA256SUMS)"
+test "$CHECKSUM_COUNT" -eq 1
+CHECKSUM_ENTRY="$(awk -v asset="$ASSET" '$2 == asset { print }' SHA256SUMS)"
+printf '%s\\n' "$CHECKSUM_ENTRY" | sha256sum --check -
+test "$(tar -tzf "$ASSET")" = "sqlite-mcp"
+tar -xzf "$ASSET"
+install -m 0755 sqlite-mcp "$TEMP_INSTALL/bin/sqlite-mcp"
+"$TEMP_INSTALL/bin/sqlite-mcp" --version
+```
+
+On macOS, use the same `set -euo pipefail`, download commands, and exact-one `CHECKSUM_COUNT`/`CHECKSUM_ENTRY` assertions, but replace the final `sha256sum --check -` with `shasum -a 256 --check -`; use `uname` to select the matching archive. The expected version output is `sqlite-mcp VERSION`. Set `TEMP_INSTALL` to any writable temporary or user-owned prefix; the example intentionally does not write to a system directory. Remove the temporary directory when finished.
+
+The compiled workspace Cargo version is the source of truth for the app and core crate. A release tag must be exactly `v{workspace version}`. Release notes are extracted from the matching changelog section only. Follow the [`release-sqlite-mcp` skill](.polytoken/skills/release-sqlite-mcp/SKILL.md) for the two-commit history sequence, exact-SHA branch-CI gate, immutable annotated tag, and draft recovery rules. This repository has not made any claim of live release success in this documentation.
 
 ## Synchronization notes
 
