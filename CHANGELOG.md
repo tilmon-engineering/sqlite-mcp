@@ -2,7 +2,7 @@
 
 All notable changes are documented here from observed repository history. Release sections use the shared Cargo workspace version and exact `v{version}` tag.
 
-Provisional first-release notes were finalized from inspected history spanning root commit `2684862` through implementation commit `8fd6bde`; the subsequent notes-only commits are not part of that inspected history.
+Provisional first-release notes were finalized from inspected history spanning root commit `2684862` through implementation commit `e9544c5`; the subsequent notes-only commits are not part of that inspected history.
 
 ## [0.1.0] - 2026-09-13
 
