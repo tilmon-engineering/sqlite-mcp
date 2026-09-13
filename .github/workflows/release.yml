@@ -52,7 +52,7 @@ jobs:
           curl --disable --proto '=https' --proto-redir '=https' --fail --silent --show-error --location "$base/actionlint_${version}_checksums.txt" --output "$RUNNER_TEMP/checksums.txt"
           (cd "$RUNNER_TEMP" && grep "  $archive$" checksums.txt | sha256sum --check --status)
           mkdir -p "$RUNNER_TEMP/actionlint/bin"
-          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/actionlint/bin" --strip-components=1 "actionlint_${version}/actionlint"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/actionlint/bin" actionlint
           echo "$RUNNER_TEMP/actionlint/bin" >> "$GITHUB_PATH"
       - name: Validate tag and changelog
         env:
@@ -147,7 +147,7 @@ jobs:
           test -n "$expected"
           if [[ "$ACTIONLINT_CHECKSUM" == sha256sum ]]; then printf '%s\n' "$expected" | (cd "$RUNNER_TEMP" && sha256sum --check --status); else printf '%s\n' "$expected" | (cd "$RUNNER_TEMP" && shasum -a 256 --check); fi
           mkdir -p "$RUNNER_TEMP/actionlint/bin"
-          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/actionlint/bin" --strip-components=1 "actionlint_${version}/actionlint"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/actionlint/bin" actionlint
           echo "$RUNNER_TEMP/actionlint/bin" >> "$GITHUB_PATH"
       - name: Determine validated tag
         env:
