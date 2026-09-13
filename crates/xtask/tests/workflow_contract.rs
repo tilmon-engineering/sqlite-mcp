@@ -79,11 +79,18 @@ fn release_workflow_contract() {
 #[test]
 fn actionlint_release_workflow() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/release.yml");
-    let status = Command::new("mise")
-        .args(["exec", "--", "actionlint"])
-        .arg(path)
-        .status()
-        .expect("actionlint installed");
+    // CI jobs install actionlint onto PATH before running the suite; local
+    // development reaches it through the pinned mise toolchain.
+    let direct = Command::new("actionlint").arg(&path).status();
+    let status = match direct {
+        Ok(status) => status,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Command::new("mise")
+            .args(["exec", "--", "actionlint"])
+            .arg(path)
+            .status()
+            .expect("actionlint available directly or through mise"),
+        Err(error) => panic!("failed to run actionlint: {error}"),
+    };
     assert!(status.success());
 }
 

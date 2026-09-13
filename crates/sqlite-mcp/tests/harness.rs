@@ -354,14 +354,28 @@ fn harness_failure_reaps_child() {
 #[test]
 fn production_test_hooks_inert() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("manifest dir");
-    let production = std::path::Path::new(&manifest)
-        .join("../../target/production-verification/debug/sqlite-mcp");
-    let production = production
-        .canonicalize()
-        .expect(
-            "production verification artifact missing; run: \
-             mise exec -- cargo build --locked -p sqlite-mcp --target-dir target/production-verification",
+    let repository = std::path::Path::new(&manifest).join("../..");
+    let artifact = repository.join("target/production-verification/debug/sqlite-mcp");
+    if !artifact.exists() {
+        // Build the pristine production binary on demand so this proof is
+        // self-contained on fresh machines and CI runners. The separate
+        // target directory keeps test-support hooks out of the artifact.
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let status = Command::new(&cargo)
+            .args(["build", "--locked", "-p", "sqlite-mcp"])
+            .arg("--target-dir")
+            .arg(repository.join("target/production-verification"))
+            .current_dir(&repository)
+            .status()
+            .expect("spawn cargo for the production verification build");
+        assert!(
+            status.success(),
+            "production verification build failed: {status}"
         );
+    }
+    let production = artifact
+        .canonicalize()
+        .expect("production verification artifact missing after the on-demand build");
     let listener = TcpListener::bind("127.0.0.1:0").expect("control listener");
     let address = listener.local_addr().expect("control address").to_string();
     listener
