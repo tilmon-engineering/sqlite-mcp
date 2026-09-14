@@ -392,6 +392,13 @@ fn release_from_json(json: &str) -> Result<DraftRelease, String> {
     })
 }
 
+/// GitHub canonicalizes stored release bodies with one trailing newline, so
+/// equality between the extracted notes and the stored body ignores only that
+/// canonical trailing line ending.
+fn notes_equivalent(stored: &str, notes: &str) -> bool {
+    stored.trim_end_matches(['\n', '\r']) == notes.trim_end_matches(['\n', '\r'])
+}
+
 fn response_body(bytes: &[u8]) -> Result<&[u8], String> {
     if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
         Ok(&bytes[index + 4..])
@@ -433,10 +440,37 @@ fn release_query<R: CommandRunner>(
         || String::from_utf8_lossy(&output.stderr)
             .lines()
             .any(|line| line.contains("404"));
-    if status_404 {
-        Ok(None)
-    } else {
-        Err(format!("release lookup failed: {}", text.trim()))
+    if !status_404 {
+        return Err(format!("release lookup failed: {}", text.trim()));
+    }
+    // Draft releases never resolve through the by-tag endpoint because the
+    // tag is not a real ref until the draft is published. Fall back to the
+    // release list and match on the stored tag name.
+    let list = runner.run(
+        "gh",
+        &[
+            arg("api"),
+            arg(format!("repos/{repo}/releases")),
+            arg("--include"),
+            arg("--header"),
+            arg("Accept: application/vnd.github+json"),
+        ],
+        None,
+    )?;
+    successful(&list, "release list")?;
+    let body =
+        std::str::from_utf8(response_body(&list.stdout)?).map_err(|_| "gh returned non-utf8")?;
+    let releases: Vec<serde_json::Value> =
+        serde_json::from_str(body).map_err(|e| format!("decode release list: {e}"))?;
+    let mut matches = releases
+        .iter()
+        .filter(|release| release.get("tagName").and_then(|v| v.as_str()) == Some(tag))
+        .map(|release| release_from_json(&release.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        _ => Err("multiple releases share this tag name; manual recovery required".into()),
     }
 }
 
@@ -529,7 +563,7 @@ fn publish_release<R: CommandRunner>(
         if release.tag != tag
             || release.target != expected_sha
             || release.assets != expected_names
-            || release.body != notes_body
+            || !notes_equivalent(&release.body, notes_body)
             || release.prerelease != prerelease
         {
             return Err(
@@ -570,7 +604,7 @@ fn publish_release<R: CommandRunner>(
             || created.tag != tag
             || created.target != expected_sha
             || created.assets != expected_names
-            || created.body != notes_body
+            || !notes_equivalent(&created.body, notes_body)
             || created.prerelease != prerelease
         {
             return Err("created draft metadata mismatch; manual recovery required".into());
@@ -1064,6 +1098,7 @@ struct GitRef {
 }
 #[derive(Debug, Deserialize)]
 struct AnnotatedTag {
+    #[serde(rename = "tag")]
     name: String,
     object: GitObject,
 }
@@ -1113,7 +1148,7 @@ pub fn verify_public_release<R: CommandRunner>(
             || release.draft
             || release.prerelease
             || release.published_at.is_none()
-            || release.body != release_notes(root, tag)?
+            || !notes_equivalent(&release.body, &release_notes(root, tag)?)
         {
             return Err("public release metadata mismatch".into());
         }
@@ -1389,9 +1424,9 @@ mod tests {
         fail_download: bool,
         fail_create: bool,
         corrupt_download: bool,
-        postcreate_mismatch: bool,
+        postcreate_release: Option<String>,
+        extra_release: Option<String>,
         publish_called: bool,
-        query_count: usize,
         public_responses: Vec<String>,
         public_http_failure: bool,
     }
@@ -1436,29 +1471,39 @@ mod tests {
                 return Ok(output(0, "200", ""));
             }
             if program == "gh" && args.first().map(String::as_str) == Some("api") {
-                self.query_count += 1;
                 if let Some(error) = &self.fail_query {
-                    if self.query_count > 1 {
-                        let metadata = if self.postcreate_mismatch {
-                            release_json(true, "other", "notes")
-                        } else {
-                            release_json(true, "sha", "notes")
-                        };
-                        return Ok(output(0, &format!("HTTP/1.1 200 OK\r\n\r\n{metadata}"), ""));
-                    }
-
                     return Ok(output(1, "", error));
                 }
-                return self
-                    .release
-                    .as_ref()
-                    .map(|r| output(0, &format!("HTTP/1.1 200 OK\r\n\r\n{r}"), ""))
-                    .ok_or_else(|| "missing release response".into());
+                // Model real GitHub: draft releases never resolve through the
+                // by-tag endpoint, while the release list contains them.
+                let by_tag = args
+                    .get(1)
+                    .map(String::as_str)
+                    .is_some_and(|endpoint| endpoint.contains("/releases/tags/"));
+                let ok = |body: &str| output(0, &format!("HTTP/1.1 200 OK\r\n\r\n{body}"), "");
+                return match (&self.release, by_tag) {
+                    (Some(release), true) if release.contains("\"isDraft\":true") => {
+                        Ok(output(1, "", "HTTP/1.1 404 Not Found"))
+                    }
+                    (Some(release), true) => Ok(ok(release)),
+                    (Some(release), false) => match &self.extra_release {
+                        Some(extra) => Ok(ok(&format!("[{release},{extra}]"))),
+                        None => Ok(ok(&format!("[{release}]"))),
+                    },
+                    (None, true) => Ok(output(1, "", "HTTP/1.1 404 Not Found")),
+                    (None, false) => Ok(ok("[]")),
+                };
             }
             if program == "gh" && args.get(1).map(String::as_str) == Some("create") {
                 if self.fail_create {
                     return Ok(output(1, "", "already exists"));
                 }
+                // Model GitHub storing the created draft: the post-create
+                // lookup must find it through the list endpoint.
+                self.release = self
+                    .postcreate_release
+                    .take()
+                    .or_else(|| Some(release_json(true, "sha", "notes")));
                 return Ok(output(0, "", ""));
             }
             if program == "gh" && args.get(1).map(String::as_str) == Some("download") {
@@ -1591,6 +1636,42 @@ mod tests {
         assert!(fake.publish_called);
     }
     #[test]
+    fn publish_resume_finds_draft_via_list_not_tag() {
+        // Real GitHub: an existing draft is invisible to the by-tag lookup
+        // and must be discovered through the release list.
+        let root = tempfile_dir();
+        let mut fake = FakeRunner::default();
+        let result = run_publish(&mut fake, Some(release_json(true, "sha", "notes")), &root);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            !fake
+                .calls
+                .iter()
+                .any(|(_, a)| a.get(1).map(String::as_str) == Some("create"))
+        );
+        assert!(fake.calls.iter().any(|(p, a)| {
+            p == "gh"
+                && a.first().map(String::as_str) == Some("api")
+                && a.get(1)
+                    .map(String::as_str)
+                    .is_some_and(|e| e.ends_with("/releases"))
+        }));
+        assert!(fake.publish_called);
+    }
+    #[test]
+    fn publish_multiple_matching_drafts_require_recovery() {
+        let root = tempfile_dir();
+        let mut fake = FakeRunner {
+            release: Some(release_json(true, "sha", "notes")),
+            extra_release: Some(release_json(true, "sha", "notes")),
+            ..Default::default()
+        };
+        let release = fake.release.clone();
+        let result = run_publish(&mut fake, release, &root);
+        assert!(result.is_err());
+        assert!(!fake.publish_called);
+    }
+    #[test]
     fn publish_checksum_exact_membership() {
         let names = release_names();
         assert!(exact_names(&names));
@@ -1599,10 +1680,7 @@ mod tests {
     #[test]
     fn publish_absent_and_auth_are_distinguished() {
         let root = tempfile_dir();
-        let mut absent = FakeRunner {
-            fail_query: Some("HTTP/1.1 404 Not Found".into()),
-            ..Default::default()
-        };
+        let mut absent = FakeRunner::default();
         assert!(run_publish(&mut absent, None, &root).is_ok());
         assert!(
             absent
@@ -1647,10 +1725,7 @@ mod tests {
         let notes = root.join("notes");
         fs::write(&notes, "notes").unwrap();
         let assets = local_assets(&root);
-        let mut fake = FakeRunner {
-            fail_query: Some("HTTP/1.1 404 Not Found".into()),
-            ..Default::default()
-        };
+        let mut fake = FakeRunner::default();
         let result = publish_release(
             &mut fake, &root, "v1.0.0", "sha", &notes, "notes", &assets, false,
         );
@@ -1696,8 +1771,7 @@ mod tests {
     fn publish_postcreate_metadata_mismatch_fails_before_edit() {
         let root = tempfile_dir();
         let mut fake = FakeRunner {
-            fail_query: Some("HTTP/1.1 404 Not Found".into()),
-            postcreate_mismatch: true,
+            postcreate_release: Some(release_json(true, "other", "notes")),
             ..Default::default()
         };
         let result = run_publish(&mut fake, None, &root);
@@ -1725,10 +1799,7 @@ mod tests {
     }
     #[test]
     fn publish_remote_peel_and_adversarial_args_are_recorded() {
-        let mut fake = FakeRunner {
-            fail_query: Some("HTTP/1.1 404 Not Found".into()),
-            ..Default::default()
-        };
+        let mut fake = FakeRunner::default();
         let root = tempfile_dir();
         let notes = root.join("notes;--bad");
         fs::write(&notes, "notes").unwrap();
@@ -1757,7 +1828,6 @@ mod tests {
         fs::write(&notes, "notes").unwrap();
         let assets = local_assets(&root);
         let mut fake = FakeRunner {
-            fail_query: Some("HTTP/1.1 404 Not Found".into()),
             fail_create: true,
             ..Default::default()
         };
@@ -1957,7 +2027,7 @@ mod tests {
         vec![
             serde_json::json!({"tag_name": tag, "draft": false, "prerelease": false, "published_at": "2026-01-02T00:00:00Z", "body": notes, "assets": assets}).to_string(),
             serde_json::json!({"object": {"sha": "tag-object", "type": "tag"}}).to_string(),
-            serde_json::json!({"name": tag, "object": {"sha": sha, "type": "commit"}}).to_string(),
+            serde_json::json!({"tag": tag, "object": {"sha": sha, "type": "commit"}}).to_string(),
         ]
     }
 
@@ -1998,6 +2068,29 @@ mod tests {
     }
 
     #[test]
+    fn public_release_metadata_accepts_trailing_newline_body() {
+        // GitHub canonicalizes stored release bodies with one trailing
+        // newline; notes equality ignores only that canonical line ending.
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let evidence = tempfile_dir().join("evidence.json");
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let mut responses = public_fixture(&root, "v0.1.0", sha);
+        let mut release: serde_json::Value = serde_json::from_str(&responses[0]).unwrap();
+        let body = release["body"].as_str().unwrap().to_owned();
+        release["body"] = serde_json::json!(format!("{body}\n"));
+        responses[0] = release.to_string();
+        let mut fake = FakeRunner {
+            public_responses: responses,
+            ..Default::default()
+        };
+        verify_public_release(&mut fake, &root, "v0.1.0", sha, &evidence).unwrap();
+        assert!(evidence.exists());
+    }
+
+    #[test]
     fn public_release_metadata_rejects_mismatch() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -2028,13 +2121,13 @@ mod tests {
             let mut responses = public_fixture(&root, "v0.1.0", sha);
             let mut release: serde_json::Value = serde_json::from_str(&responses[0]).unwrap();
             match case {
-                "wrong_sha" => responses[2] = serde_json::json!({"name":"v0.1.0","object":{"sha":"ffffffffffffffffffffffffffffffffffffffff","type":"commit"}}).to_string(),
-                "wrong_tag_name" => responses[2] = serde_json::json!({"name":"v9.9.9","object":{"sha":sha,"type":"commit"}}).to_string(),
+                "wrong_sha" => responses[2] = serde_json::json!({"tag":"v0.1.0","object":{"sha":"ffffffffffffffffffffffffffffffffffffffff","type":"commit"}}).to_string(),
+                "wrong_tag_name" => responses[2] = serde_json::json!({"tag":"v9.9.9","object":{"sha":sha,"type":"commit"}}).to_string(),
                 "missing_tag_name" => responses[2] = serde_json::json!({"object":{"sha":sha,"type":"commit"}}).to_string(),
-                "wrong_tag_object_type" => responses[2] = serde_json::json!({"name":"v1.0.0","object":{"sha":sha,"type":"tree"}}).to_string(),
+                "wrong_tag_object_type" => responses[2] = serde_json::json!({"tag":"v1.0.0","object":{"sha":sha,"type":"tree"}}).to_string(),
                 "wrong_tag_object_sha" => responses[1] = serde_json::json!({"object":{"type":"tag"}}).to_string(),
                 "missing_release_body" => { release.as_object_mut().unwrap().remove("body"); },
-                "missing_annotated_object" => responses[2] = serde_json::json!({"name":"v0.1.0"}).to_string(),
+                "missing_annotated_object" => responses[2] = serde_json::json!({"tag":"v0.1.0"}).to_string(),
                 "lightweight" => responses[1] = serde_json::json!({"object":{"sha":sha,"type":"commit"}}).to_string(),
                 "tag_name" => release["tag_name"] = serde_json::json!("v9.9.9"),
                 "body" => release["body"] = serde_json::json!("wrong"),
