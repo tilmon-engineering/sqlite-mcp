@@ -380,16 +380,9 @@ fn successful(output: &CommandOutput, operation: &str) -> Result<(), String> {
     }
 }
 
-fn release_from_json(json: &str) -> Result<DraftRelease, String> {
-    let r: GhRelease = serde_json::from_str(json).map_err(|e| format!("decode release: {e}"))?;
-    Ok(DraftRelease {
-        tag: r.tag,
-        target: r.target,
-        assets: r.assets.into_iter().map(|a| a.name).collect(),
-        body: r.body,
-        prerelease: r.prerelease,
-        published: !r.draft,
-    })
+fn rest_release_from_json(json: &str) -> Result<DraftRelease, String> {
+    let r: RestRelease = serde_json::from_str(json).map_err(|e| format!("decode release: {e}"))?;
+    Ok(r.into_draft())
 }
 
 /// GitHub canonicalizes stored release bodies with one trailing newline, so
@@ -428,7 +421,7 @@ fn release_query<R: CommandRunner>(
     )?;
     let text = String::from_utf8_lossy(&output.stdout);
     if output.code == Some(0) {
-        return Ok(Some(release_from_json(
+        return Ok(Some(rest_release_from_json(
             std::str::from_utf8(response_body(&output.stdout)?)
                 .map_err(|_| "gh returned non-utf8")?,
         )?));
@@ -445,28 +438,38 @@ fn release_query<R: CommandRunner>(
     }
     // Draft releases never resolve through the by-tag endpoint because the
     // tag is not a real ref until the draft is published. Fall back to the
-    // release list and match on the stored tag name.
+    // paginated release list (raw REST: snake_case `tag_name`) and match on
+    // the stored tag name. `--paginate` concatenates one JSON array document
+    // per page into stdout, so `--include` (single-header framing) is not
+    // used here; each page is decoded as a standalone array.
     let list = runner.run(
         "gh",
         &[
             arg("api"),
             arg(format!("repos/{repo}/releases")),
-            arg("--include"),
+            arg("--paginate"),
             arg("--header"),
             arg("Accept: application/vnd.github+json"),
         ],
         None,
     )?;
     successful(&list, "release list")?;
-    let body =
-        std::str::from_utf8(response_body(&list.stdout)?).map_err(|_| "gh returned non-utf8")?;
-    let releases: Vec<serde_json::Value> =
-        serde_json::from_str(body).map_err(|e| format!("decode release list: {e}"))?;
-    let mut matches = releases
-        .iter()
-        .filter(|release| release.get("tagName").and_then(|v| v.as_str()) == Some(tag))
-        .map(|release| release_from_json(&release.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
+    let body = std::str::from_utf8(&list.stdout).map_err(|_| "gh returned non-utf8")?;
+    let stream = serde_json::Deserializer::from_str(body).into_iter::<Vec<RestRelease>>();
+    let mut matches: Vec<DraftRelease> = Vec::new();
+    let mut pages = 0usize;
+    for page in stream {
+        let page = page.map_err(|e| format!("decode release list page: {e}"))?;
+        pages += 1;
+        for release in page {
+            if release.tag_name == tag {
+                matches.push(release.into_draft());
+            }
+        }
+    }
+    if pages == 0 {
+        return Err("release list returned no pages".into());
+    }
     match matches.len() {
         0 => Ok(None),
         1 => Ok(matches.pop()),
@@ -891,21 +894,38 @@ fn package_binary(
     let _ = fs::remove_dir_all(staging);
     result
 }
+/// Raw REST (`gh api`) release representation: GitHub's REST payloads use
+/// snake_case fields (`tag_name`, `target_commitish`, `published_at`). This
+/// is the ONLY valid shape for the raw `gh api` by-tag lookup and the
+/// paginated release list. The camelCase field spellings (`tagName`,
+/// `isDraft`, `targetCommitish`) belong exclusively to the separate
+/// `gh release view --json` output shape and never appear in REST payloads.
 #[derive(Deserialize)]
-struct GhRelease {
-    #[serde(rename = "isDraft")]
+struct RestRelease {
+    #[serde(default)]
     draft: bool,
-    #[serde(rename = "isPrerelease")]
     prerelease: bool,
-    #[serde(rename = "tagName")]
-    tag: String,
-    #[serde(rename = "targetCommitish")]
-    target: String,
+    tag_name: String,
+    target_commitish: String,
+    #[serde(default)]
     body: String,
-    assets: Vec<GhAsset>,
+    #[serde(default)]
+    assets: Vec<RestAsset>,
+}
+impl RestRelease {
+    fn into_draft(self) -> DraftRelease {
+        DraftRelease {
+            tag: self.tag_name,
+            target: self.target_commitish,
+            assets: self.assets.into_iter().map(|a| a.name).collect(),
+            body: self.body,
+            prerelease: self.prerelease,
+            published: !self.draft,
+        }
+    }
 }
 #[derive(Deserialize)]
-struct GhAsset {
+struct RestAsset {
     name: String,
 }
 fn sha256(path: &Path) -> Result<String, String> {
@@ -1429,6 +1449,10 @@ mod tests {
         publish_called: bool,
         public_responses: Vec<String>,
         public_http_failure: bool,
+        /// Queued raw REST release-list pages (snake_case payloads). Served
+        /// concatenated for the paginated list endpoint only; an empty queue
+        /// falls back to `release`/`extra_release`.
+        rest_release_pages: Vec<String>,
     }
     impl CommandRunner for FakeRunner {
         fn run(
@@ -1475,23 +1499,30 @@ mod tests {
                     return Ok(output(1, "", error));
                 }
                 // Model real GitHub: draft releases never resolve through the
-                // by-tag endpoint, while the release list contains them.
+                // by-tag endpoint, while the release list contains them. The
+                // by-tag call uses `--include` (single-header framing); the
+                // paginated list call emits raw concatenated JSON pages.
                 let by_tag = args
                     .get(1)
                     .map(String::as_str)
                     .is_some_and(|endpoint| endpoint.contains("/releases/tags/"));
                 let ok = |body: &str| output(0, &format!("HTTP/1.1 200 OK\r\n\r\n{body}"), "");
+                if !by_tag && !self.rest_release_pages.is_empty() {
+                    let body = self.rest_release_pages.concat();
+                    self.rest_release_pages.clear();
+                    return Ok(output(0, &body, ""));
+                }
                 return match (&self.release, by_tag) {
-                    (Some(release), true) if release.contains("\"isDraft\":true") => {
+                    (Some(release), true) if release.contains("\"draft\":true") => {
                         Ok(output(1, "", "HTTP/1.1 404 Not Found"))
                     }
                     (Some(release), true) => Ok(ok(release)),
                     (Some(release), false) => match &self.extra_release {
-                        Some(extra) => Ok(ok(&format!("[{release},{extra}]"))),
-                        None => Ok(ok(&format!("[{release}]"))),
+                        Some(extra) => Ok(output(0, &format!("[{release},{extra}]"), "")),
+                        None => Ok(output(0, &format!("[{release}]"), "")),
                     },
                     (None, true) => Ok(output(1, "", "HTTP/1.1 404 Not Found")),
-                    (None, false) => Ok(ok("[]")),
+                    (None, false) => Ok(output(0, "[]", "")),
                 };
             }
             if program == "gh" && args.get(1).map(String::as_str) == Some("create") {
@@ -1562,7 +1593,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            r#"{{"isDraft":{draft},"isPrerelease":false,"tagName":"v1.0.0","targetCommitish":"{target}","body":"{body}","assets":[{assets}]}}"#
+            r#"{{"draft":{draft},"prerelease":false,"tag_name":"v1.0.0","target_commitish":"{target}","body":"{body}","assets":[{assets}]}}"#
         )
     }
     fn run_publish(
@@ -1670,6 +1701,111 @@ mod tests {
         let result = run_publish(&mut fake, release, &root);
         assert!(result.is_err());
         assert!(!fake.publish_called);
+    }
+
+    fn rest_page(tag: &str, draft: bool) -> String {
+        format!(
+            r#"[{{"draft":{draft},"prerelease":false,"tag_name":"{tag}","target_commitish":"sha","body":"notes","assets":[]}}]"#
+        )
+    }
+
+    fn assert_paginated_list_call(fake: &FakeRunner) {
+        let list_call = fake
+            .calls
+            .iter()
+            .find(|(program, args)| {
+                program == "gh"
+                    && args.first().map(String::as_str) == Some("api")
+                    && args
+                        .get(1)
+                        .map(String::as_str)
+                        .is_some_and(|endpoint| endpoint.ends_with("/releases"))
+            })
+            .expect("paginated release-list call recorded");
+        assert!(
+            list_call.1.iter().any(|a| a == "--paginate"),
+            "release-list call must use --paginate: {:?}",
+            list_call.1
+        );
+        assert!(
+            !list_call.1.iter().any(|a| a == "--include"),
+            "release-list call must not use --include (multi-page framing): {:?}",
+            list_call.1
+        );
+        assert!(
+            fake.rest_release_pages.is_empty(),
+            "all queued REST pages must be consumed"
+        );
+    }
+
+    #[test]
+    fn rest_list_page_two_only_match() {
+        // The matching draft lives on the second page; the first page holds
+        // an unrelated tag. Discovery must survive page concatenation.
+        let mut fake = FakeRunner {
+            rest_release_pages: vec![rest_page("v0.9.0", false), rest_page("v1.0.0", true)],
+            ..Default::default()
+        };
+        let found = release_query(&mut fake, "o/r", "v1.0.0").expect("query ok");
+        let found = found.expect("draft discovered on page two");
+        assert_eq!(found.tag, "v1.0.0");
+        assert!(!found.published, "draft must be reported as unpublished");
+        assert_paginated_list_call(&fake);
+    }
+
+    #[test]
+    fn rest_list_malformed_page_is_an_error() {
+        let mut fake = FakeRunner {
+            rest_release_pages: vec![rest_page("v0.9.0", false), "{\"unterminated".to_owned()],
+            ..Default::default()
+        };
+        let error = release_query(&mut fake, "o/r", "v1.0.0").expect_err("malformed page");
+        assert!(
+            error.contains("decode release list page"),
+            "unexpected error: {error}"
+        );
+        assert_paginated_list_call(&fake);
+    }
+
+    #[test]
+    fn rest_list_non_array_page_is_an_error() {
+        let mut fake = FakeRunner {
+            rest_release_pages: vec![r#"{"tag_name":"v1.0.0","draft":true}"#.to_owned()],
+            ..Default::default()
+        };
+        let error = release_query(&mut fake, "o/r", "v1.0.0").expect_err("non-array page");
+        assert!(
+            error.contains("decode release list page"),
+            "unexpected error: {error}"
+        );
+        assert_paginated_list_call(&fake);
+    }
+
+    #[test]
+    fn rest_list_duplicate_across_pages_is_ambiguity() {
+        let mut fake = FakeRunner {
+            rest_release_pages: vec![rest_page("v1.0.0", true), rest_page("v1.0.0", true)],
+            ..Default::default()
+        };
+        let error = release_query(&mut fake, "o/r", "v1.0.0").expect_err("duplicates");
+        assert!(
+            error.contains("multiple releases share this tag name"),
+            "unexpected error: {error}"
+        );
+        assert_paginated_list_call(&fake);
+    }
+
+    #[test]
+    fn publish_duplicate_drafts_across_rest_pages_require_recovery() {
+        let root = tempfile_dir();
+        let mut fake = FakeRunner {
+            rest_release_pages: vec![rest_page("v1.0.0", true), rest_page("v1.0.0", true)],
+            ..Default::default()
+        };
+        let result = run_publish(&mut fake, None, &root);
+        assert!(result.is_err());
+        assert!(!fake.publish_called);
+        assert_paginated_list_call(&fake);
     }
     #[test]
     fn publish_checksum_exact_membership() {

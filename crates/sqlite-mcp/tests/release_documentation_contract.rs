@@ -144,6 +144,50 @@ fn release_documentation_contract() {
     );
 }
 
+/// Every line that discusses matching a raw REST (`gh api`) release list must
+/// reference `tag_name`; the camelCase `tagName` spelling is permitted only
+/// on lines that also identify the separate `gh release ... --json` shape.
+fn assert_rest_lines_use_tag_name(name: &str, text: &str) {
+    for line in text.lines() {
+        let mentions_rest_list = line.contains("gh api") && line.contains("releases")
+            || line.contains("REST") && line.contains("release list");
+        if !mentions_rest_list {
+            continue;
+        }
+        assert!(
+            line.contains("`tag_name`"),
+            "{name} REST release-list line must match on `tag_name`: {line}"
+        );
+        if line.contains("`tagName`") {
+            assert!(
+                line.contains("--json"),
+                "{name} REST-context camelCase `tagName` is rejected unless the line also \
+                 identifies the `gh release --json` shape: {line}"
+            );
+        }
+    }
+}
+
+#[test]
+fn skill_documents_rest_tag_name() {
+    let skill = repository_file(".polytoken/skills/release-sqlite-mcp/SKILL.md");
+    assert_rest_lines_use_tag_name("SKILL.md", &skill);
+    assert!(
+        skill.contains("`tagName`") && skill.contains("--json"),
+        "the separate `gh release --json` tagName shape must stay documented"
+    );
+}
+
+#[test]
+fn design_documents_rest_tag_name() {
+    let design = repository_file("DESIGN.md");
+    assert_rest_lines_use_tag_name("DESIGN.md", &design);
+    assert!(
+        design.contains("`tagName`") && design.contains("--json"),
+        "DESIGN must retain the `gh release --json` tagName context"
+    );
+}
+
 #[test]
 fn workflow_documented_commands_contract() {
     let agents = repository_file("AGENTS.md");
