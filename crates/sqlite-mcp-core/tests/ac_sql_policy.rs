@@ -116,6 +116,12 @@ async fn analyze_and_reindex_denied() {
         "REINDEX/**/",
         "ANALYZE/**/",
         "ANALYZE/*c*/main.t",
+        // EXPLAIN is a diagnostic prefix: the underlying maintenance
+        // statement is still denied (R2-2).
+        "EXPLAIN REINDEX",
+        "EXPLAIN/**/REINDEX",
+        "EXPLAIN QUERY PLAN REINDEX",
+        "EXPLAIN QUERY PLAN ANALYZE",
     ] {
         let err = core
             .query(&id, sql, &[])
@@ -132,6 +138,48 @@ async fn analyze_and_reindex_denied() {
     core.query(&id, "SELECT count(*) FROM t", &[])
         .await
         .expect("read after denied maintenance");
+    core.query(&id, "EXPLAIN QUERY PLAN SELECT 1", &[])
+        .await
+        .expect("EXPLAIN QUERY PLAN of an allowed statement stays allowed");
+    core.rollback(&id).await.unwrap();
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn stored_body_guard_accepts_pragma_named_identifiers() {
+    // Quoted identifiers (and string literals) containing `pragma_` cannot
+    // trigger the stored-body structural denial (R2-1).
+    let (_dir, core, _path, id) = setup().await;
+    core.query(&id, "CREATE VIEW \"a-b-pragma_x\" AS SELECT 1", &[])
+        .await
+        .expect("quoted view name containing pragma_ must be allowed");
+    core.query(&id, "CREATE VIEW \"weird-name\" AS SELECT 1", &[])
+        .await
+        .expect("quoted view name with punctuation must be allowed");
+    core.query(
+        &id,
+        "CREATE TRIGGER \"t-pragma_x\" AFTER INSERT ON t BEGIN SELECT 1; END",
+        &[],
+    )
+    .await
+    .expect("quoted trigger name containing pragma_ must be allowed");
+    core.query(&id, "SELECT * FROM \"a-b-pragma_x\"", &[])
+        .await
+        .expect("the created view is readable");
+    // A real unquoted pragma table-valued reference in a stored body is
+    // still rejected.
+    let result = core
+        .query(
+            &id,
+            "CREATE VIEW bad AS SELECT * FROM pragma_table_info('t')",
+            &[],
+        )
+        .await;
+    let err = result.expect_err("pragma reference in stored body must be denied");
+    assert!(
+        err.to_string().contains("denied by SQL policy"),
+        "unexpected denial shape: {err}"
+    );
     core.rollback(&id).await.unwrap();
     core.shutdown().await;
 }

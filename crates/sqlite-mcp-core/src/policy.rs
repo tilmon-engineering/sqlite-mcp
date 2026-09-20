@@ -362,6 +362,88 @@ impl<'a> Cursor<'a> {
         self.rest = remainder;
         Some(word)
     }
+
+    /// Consume the next token when it is exactly `word` (case-insensitive,
+    /// bounded by a non-identifier character); otherwise leave the cursor
+    /// unchanged.
+    fn skip_word_if(&mut self, word: &str) -> bool {
+        self.skip_trivia();
+        let lowered = self.rest.to_ascii_lowercase();
+        let matches = lowered.starts_with(word)
+            && !lowered[word.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$');
+        if matches {
+            self.rest = &self.rest[word.len()..];
+        }
+        matches
+    }
+
+    /// Consume one object-name token: a quoted identifier (`"…"`, `` `…` ``,
+    /// `[…]`, with doubled-quote escapes) as a single unit, or one plain
+    /// token.
+    fn skip_quoted_or_token(&mut self) {
+        self.skip_trivia();
+        let close = match self.rest.chars().next() {
+            Some('"') => Some('"'),
+            Some('`') => Some('`'),
+            Some('[') => Some(']'),
+            _ => None,
+        };
+        if let Some(close) = close {
+            self.rest = &self.rest[1..];
+            while let Some(inner) = self.rest.chars().next() {
+                self.rest = &self.rest[inner.len_utf8()..];
+                if inner == close {
+                    if close != ']' && self.rest.starts_with(close) {
+                        self.rest = &self.rest[close.len_utf8()..];
+                    } else {
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+        let _ = self.next();
+    }
+
+    /// Consume a balanced parenthesized group when the next character opens
+    /// one (view column lists); nested groups and quoted segments are
+    /// consumed whole.
+    fn skip_parenthesized(&mut self) {
+        self.skip_trivia();
+        if !self.rest.starts_with('(') {
+            return;
+        }
+        let mut depth = 0usize;
+        while let Some(c) = self.rest.chars().next() {
+            self.rest = &self.rest[c.len_utf8()..];
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return;
+                    }
+                }
+                '"' | '`' | '\'' => {
+                    let close = c;
+                    while let Some(inner) = self.rest.chars().next() {
+                        self.rest = &self.rest[inner.len_utf8()..];
+                        if inner == close {
+                            if self.rest.starts_with(close) {
+                                self.rest = &self.rest[close.len_utf8()..];
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Defense-in-depth for maintenance statements. SQLite fires an internal
@@ -374,9 +456,43 @@ impl<'a> Cursor<'a> {
 /// [`check_stored_body`], not a general keyword scan.
 pub fn check_maintenance(sql: &str) -> Result<(), PolicyError> {
     let mut cursor = Cursor { rest: sql };
-    match cursor.next().map(|w| w.to_ascii_lowercase()).as_deref() {
+    let keyword = first_statement_keyword(&mut cursor);
+    // `EXPLAIN [QUERY PLAN]` is a diagnostic prefix over an underlying
+    // statement: the underlying statement's first keyword governs, so
+    // `EXPLAIN REINDEX` and `EXPLAIN QUERY PLAN REINDEX` are denied like
+    // their unprefixed forms (DESIGN §5: EXPLAIN of a denied statement is
+    // denied).
+    let keyword = match keyword.as_deref() {
+        Some("explain") => {
+            let mut inner = first_statement_keyword(&mut cursor);
+            if inner.as_deref() == Some("query") {
+                let after_query = first_statement_keyword(&mut cursor);
+                if after_query.as_deref() == Some("plan") {
+                    inner = first_statement_keyword(&mut cursor);
+                }
+            }
+            inner
+        }
+        other => other.map(ToOwned::to_owned),
+    };
+    match keyword.as_deref() {
         Some("analyze") | Some("reindex") => Err(PolicyError::Maintenance),
         _ => Ok(()),
+    }
+}
+
+/// The next identifier-shaped token, lowercased; punctuation tokens and
+/// comments are skipped because SQLite treats them as trivia between
+/// keywords.
+fn first_statement_keyword(cursor: &mut Cursor<'_>) -> Option<String> {
+    loop {
+        let token = cursor.next()?;
+        if token
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        {
+            return Some(token.to_ascii_lowercase());
+        }
     }
 }
 
@@ -402,21 +518,69 @@ pub fn check_stored_body(sql: &str, mutation_seen: &MutationSignal) -> Result<()
         _ => kind,
     };
     if matches!(kind.as_deref(), Some("view") | Some("trigger")) {
-        // Skip the optional IF [NOT] EXISTS and the object name; the body is
-        // conservatively scanned for denied pragma table-valued references.
-        cursor.next();
-        cursor.next();
-        cursor.next();
-        cursor.next();
         // A structurally denied stored-body CREATE VIEW/TRIGGER is still
         // classified as DDL so the request marker is drained consistently;
         // it does not by itself invalidate a committed schema observation.
         mutation_seen.mark_ddl_attempt();
-        if cursor.rest.to_ascii_lowercase().contains("pragma_") {
+        // Skip the optional IF [NOT] EXISTS, the object name as one
+        // quoted-aware token, and an optional view column list, then scan
+        // only the body region. Quoted identifiers and string literals are
+        // never treated as pragma references, so an object name such as
+        // "a-b-pragma_x" cannot cause a false denial.
+        cursor.skip_word_if("if");
+        cursor.skip_word_if("not");
+        cursor.skip_word_if("exists");
+        cursor.skip_quoted_or_token();
+        cursor.skip_parenthesized();
+        if contains_unquoted_pragma_ref(cursor.rest) {
             return Err(PolicyError::Denied);
         }
     }
     Ok(())
+}
+
+/// True when `text` contains a `pragma_` reference outside quoted
+/// identifiers and string literals. Quoted segments (`"…"`, `` `…` ``,
+/// `[…]`, `'…'`, with doubled-quote escapes) cannot execute a pragma
+/// table-valued function, so their contents are skipped.
+fn contains_unquoted_pragma_ref(text: &str) -> bool {
+    let mut unquoted = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' | '`' => {
+                while let Some(inner) = chars.next() {
+                    if inner == c {
+                        if chars.peek() == Some(&c) {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '\'' => {
+                while let Some(inner) = chars.next() {
+                    if inner == '\'' {
+                        if chars.peek() == Some(&'\'') {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '[' => {
+                for inner in chars.by_ref() {
+                    if inner == ']' {
+                        break;
+                    }
+                }
+            }
+            _ => unquoted.extend(c.to_lowercase()),
+        }
+    }
+    unquoted.contains("pragma_")
 }
 #[cfg(test)]
 pub fn unknown_action_denied() -> bool {
@@ -768,6 +932,14 @@ mod tests {
             "ANALYZE/**/",
             "ANALYZE/*c*/main.t",
             "ANALYZE--c\n",
+            // EXPLAIN is a diagnostic prefix over the underlying statement:
+            // the underlying maintenance keyword governs.
+            "EXPLAIN REINDEX",
+            "EXPLAIN/**/REINDEX",
+            "EXPLAIN QUERY PLAN REINDEX",
+            "EXPLAIN ANALYZE",
+            "EXPLAIN QUERY PLAN ANALYZE",
+            "EXPLAIN/**/QUERY/**/PLAN/**/REINDEX",
         ] {
             assert!(
                 check_maintenance(sql).is_err(),
@@ -784,10 +956,50 @@ mod tests {
             "INSERT INTO t VALUES ('analyze')",
             "SELECT 1 -- reindex",
             "DELETE FROM t WHERE a = 'REINDEX'",
+            "EXPLAIN SELECT 1",
+            "EXPLAIN QUERY PLAN SELECT 1",
+            "EXPLAIN QUERY PLAN CREATE INDEX i ON t(a)",
         ] {
             assert!(
                 check_maintenance(sql).is_ok(),
                 "ordinary statement rejected: {sql:?}"
+            );
+        }
+    }
+
+    /// The stored-body structural guard is quoted-identifier and string
+    /// literal aware: object names and quoted body text containing
+    /// `pragma_` cannot cause a false denial, while real unquoted pragma
+    /// table-valued references in the body are still rejected (R2-1).
+    #[test]
+    fn stored_body_guard_is_quoted_aware() {
+        let signal = MutationSignal::new();
+        for sql in [
+            "CREATE VIEW \"a-b-pragma_x\" AS SELECT 1",
+            "CREATE VIEW \"weird-name\" AS SELECT 1",
+            "CREATE VIEW `back-pragma_x` AS SELECT 1",
+            "CREATE VIEW [brack-pragma_x] AS SELECT 1",
+            "CREATE VIEW v AS SELECT 'pragma_x'",
+            "CREATE VIEW v AS SELECT \"pragma_x\"",
+            "CREATE TRIGGER \"t-pragma_x\" AFTER INSERT ON t BEGIN SELECT 1; END",
+            "CREATE VIEW IF NOT EXISTS \"a-b-pragma_x\" AS SELECT 1",
+        ] {
+            assert!(
+                check_stored_body(sql, &signal).is_ok(),
+                "legitimate stored-body statement rejected: {sql:?}"
+            );
+        }
+        for sql in [
+            "CREATE VIEW pv AS SELECT * FROM pragma_table_info('t')",
+            "CREATE/**/VIEW bv AS SELECT * FROM pragma_table_info('t')",
+            "CREATE VIEW/**/bv AS SELECT * FROM pragma_table_info('t')",
+            "CREATE VIEW v(x) AS SELECT * FROM pragma_table_info('t')",
+            "CREATE TRIGGER g AFTER INSERT ON t BEGIN SELECT * FROM pragma_table_info('t'); END",
+            "CREATE TEMP VIEW tv AS SELECT * FROM pragma_table_info('t')",
+        ] {
+            assert!(
+                check_stored_body(sql, &signal).is_err(),
+                "stored body with pragma reference accepted: {sql:?}"
             );
         }
     }
