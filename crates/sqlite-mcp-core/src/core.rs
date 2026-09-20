@@ -570,13 +570,26 @@ impl Core {
     ) -> Result<Handle, CoreError> {
         let (gate, _w) = self.handle_gate(id).await?;
         let _operation = gate.lock().await;
-        let (readonly, observed, expected_version, expired) = {
+        let (readonly, observed, expected_version, expired, transaction_open) = {
             let s = self.inner.lock().await;
             let (h, _) = s.handles.get(id).ok_or(CoreError::UnknownHandle)?;
-            (h.readonly, h.schema_observed, h.schema_version, h.expired)
+            (
+                h.readonly,
+                h.schema_observed,
+                h.schema_version,
+                h.expired,
+                h.transaction_id.is_some(),
+            )
         };
         if expired {
             return Err(CoreError::TransactionExpired);
+        }
+        if transaction_open {
+            // Mirror close_database's open-transaction refusal: the worker
+            // BEGIN is never reached, so the existing transaction's state
+            // stays truthful and the public envelope reports
+            // TX_ALREADY_OPEN.
+            return Err(CoreError::TransactionOpen);
         }
         if !observed {
             return Err(CoreError::SchemaRequired);
@@ -859,5 +872,38 @@ impl Core {
                 uncertain_or_invalidated,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// In-crate pin: a second begin while a transaction is open fails fast
+    /// with `CoreError::TransactionOpen` before the worker BEGIN is ever
+    /// dispatched (an external integration test cannot name the private
+    /// error path, and the protocol envelope is pinned separately).
+    #[tokio::test]
+    async fn second_begin_returns_transaction_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::new(Config::default()).unwrap();
+        let (path, _) = core
+            .create_database(dir.path().join("begin-pin.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        let handle = core.open_database(&path, false).await.unwrap();
+        core.get_schema(&handle.id).await.unwrap();
+        core.begin_transaction(&handle.id, "deferred")
+            .await
+            .unwrap();
+        let second = core.begin_transaction(&handle.id, "deferred").await;
+        assert!(
+            matches!(second, Err(CoreError::TransactionOpen)),
+            "second begin must fail with TransactionOpen, got {second:?}"
+        );
+        // The original transaction remains usable.
+        core.query(&handle.id, "SELECT 1", &[]).await.unwrap();
+        core.rollback(&handle.id).await.unwrap();
+        core.shutdown().await;
     }
 }

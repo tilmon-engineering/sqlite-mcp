@@ -74,3 +74,12 @@ fn readme_documents_change_counts() {
         "README must document the per-statement change-count rule"
     );
 }
+
+#[test]
+fn readme_documents_tx_already_open() {
+    let readme = readme();
+    assert!(
+        readme.contains("Beginning a transaction while one is open reports `TX_ALREADY_OPEN`"),
+        "README must document the second-begin TX_ALREADY_OPEN class"
+    );
+}

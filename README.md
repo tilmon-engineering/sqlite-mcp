@@ -67,7 +67,7 @@ The v1 tool set is intentionally small. Tool argument objects use closed schemas
 2. `open_database(path, readonly)` — opens an existing valid initialized database. `readonly` is required and fixed for that connection; opening never creates or initializes.
 3. `list_handles()` — returns bounded live-handle metadata.
 4. `get_schema(handle)` — returns complete bounded SQLite schema metadata and establishes the required schema observation.
-5. `begin_transaction(handle, mode)` — begins `deferred` (default) or `immediate`; immediate is rejected on read-only handles.
+5. `begin_transaction(handle, mode)` — begins `deferred` (default) or `immediate`; immediate is rejected on read-only handles. Beginning a transaction while one is open reports `TX_ALREADY_OPEN`.
 6. `query(handle, sql, parameters)` — executes exactly one statement inside the active transaction using positional typed parameters; successful local schema changes remain usable for subsequent statements in the same transaction. Only DML statements report affected-row counts (`changes`); SELECT/DDL report zero.
 7. `commit(handle)` — persists and closes the active transaction; after an actual schema change committed, perform one `get_schema` after commit before the next begin/query; read-only/DML-only work retains the prior observation.
 8. `rollback(handle)` — discards active work; idempotent for a valid idle handle.

@@ -162,3 +162,49 @@ async fn result_too_large_class_reported() {
     assert_envelope(&rollback, false);
     fixture.close().await;
 }
+
+#[tokio::test]
+async fn second_begin_reports_tx_already_open() {
+    let fixture = Fixture::new().await;
+    let created = fixture
+        .call("create_database", json!({"path": fixture.path}))
+        .await;
+    assert_envelope(&created, false);
+    let opened = fixture
+        .call(
+            "open_database",
+            json!({"path": fixture.path, "readonly": false}),
+        )
+        .await;
+    let id = handle(assert_envelope(&opened, false));
+    fixture.call("get_schema", json!({"handle": id})).await;
+    let begun = fixture
+        .call("begin_transaction", json!({"handle": id}))
+        .await;
+    let begun_value = assert_envelope(&begun, false);
+    let transaction_id = begun_value["handle_state"]["transaction_id"].clone();
+    assert!(transaction_id.is_string());
+    let second = fixture
+        .call("begin_transaction", json!({"handle": id}))
+        .await;
+    let error = assert_envelope(&second, true)["error"].clone();
+    assert_eq!(error["class"], "TX_ALREADY_OPEN", "{error}");
+    assert_eq!(error["transaction_open"], true, "{error}");
+    assert_eq!(error["transaction_continuable"], true, "{error}");
+    assert_eq!(
+        assert_envelope(&second, true)["handle_state"]["transaction_id"],
+        transaction_id,
+        "the original transaction ID must be unchanged"
+    );
+    // The original transaction remains usable.
+    let query = fixture
+        .call(
+            "query",
+            json!({"handle": id, "sql": "SELECT 1", "parameters": []}),
+        )
+        .await;
+    assert_envelope(&query, false);
+    let rollback = fixture.call("rollback", json!({"handle": id})).await;
+    assert_envelope(&rollback, false);
+    fixture.close().await;
+}
