@@ -149,6 +149,13 @@ const RETAINED_PER_EVENT: usize = 4096;
 const EMIT_BLOCK_LIMIT: Duration = Duration::from_secs(10);
 
 static REGISTRY: OnceLock<(Mutex<HashMap<Event, Slot>>, Condvar)> = OnceLock::new();
+
+/// Process-global serialization for in-process tests that (a) manipulate the
+/// `SQLITE_MCP_TEST_SUPPORT` marker, or (b) run workers whose marker-gated
+/// emissions the fixture assertions count. Cargo test runs lib tests on
+/// parallel threads while the registry, injected clock, and marker are all
+/// process-global.
+pub static TEST_HOOK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 fn registry() -> &'static (Mutex<HashMap<Event, Slot>>, Condvar) {
     REGISTRY.get_or_init(|| (Mutex::new(HashMap::new()), Condvar::new()))
 }

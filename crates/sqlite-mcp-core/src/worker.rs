@@ -911,17 +911,15 @@ mod tests {
     /// installs a bounded busy window before its first SQLite operation,
     /// clears it exactly once on every exit path, and leaves no window
     /// behind for the next command.
-    /// Env-var manipulation is process-global, so the fixture tests
-    /// serialize on this lock (cargo test runs them on parallel threads).
-    static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct SupportGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+    /// Env-var manipulation is process-global and other lib tests (for
+    /// example core lifecycle pins) also run workers whose emissions the
+    /// fixture counts, so every hook-touching test serializes on the shared
+    /// test-support lock.
+    struct SupportGuard(#[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>);
     impl SupportGuard {
-        fn enable() -> Self {
-            let guard = FIXTURE_LOCK
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            // SAFETY: the fixture lock serializes every test that touches the
+        async fn enable() -> Self {
+            let guard = test_support::TEST_HOOK_LOCK.lock().await;
+            // SAFETY: the shared lock serializes every test that touches the
             // marker, and the marker is removed before the guard releases.
             unsafe {
                 std::env::set_var("SQLITE_MCP_TEST_SUPPORT", "1");
@@ -1048,7 +1046,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_normal_guard_window() {
-        let _support = SupportGuard::enable();
+        let _support = SupportGuard::enable().await;
         let (_dir, worker) = start_test_worker(60);
         let job: Job = Box::new(|c: &mut Connection, _ctx: &RequestContext| {
             policy::trusted(|| c.execute_batch("SELECT 1")).map_err(WorkerError::Sqlite)?;
@@ -1074,7 +1072,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_idle_expiry_guard_window() {
-        let _support = SupportGuard::enable();
+        let _support = SupportGuard::enable().await;
         let (_dir, worker) = start_test_worker(60);
         // Open a transaction, then move the injected clock past the idle
         // deadline so the next Run takes the idle-expiry rollback branch.
@@ -1094,7 +1092,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_client_cancel_cleanup_guard_window() {
-        let _support = SupportGuard::enable();
+        let _support = SupportGuard::enable().await;
         let (_dir, worker) = start_test_worker(60);
         // The job cancels its own request token and then fails with a SQLite
         // error, so the post-request client-cancellation cleanup path
@@ -1114,7 +1112,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_deadline_cleanup_guard_window() {
-        let _support = SupportGuard::enable();
+        let _support = SupportGuard::enable().await;
         let (_dir, worker) = start_test_worker(60);
         // Deadline expires while the job runs and the job returns a SQLite
         // error, entering the truthful deadline cleanup path.
@@ -1137,7 +1135,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_shutdown_cleanup_guard_window() {
-        let _support = SupportGuard::enable();
+        let _support = SupportGuard::enable().await;
         let (_dir, worker) = start_test_worker(60);
         // Cancel the worker's shutdown token inside the job and return a
         // SQLite error, entering the shutdown cleanup path.
@@ -1154,7 +1152,7 @@ mod tests {
 
     #[tokio::test]
     async fn control_and_commit_guard_windows() {
-        let _support = SupportGuard::enable();
+        let _support = SupportGuard::enable().await;
         let (_dir, worker) = start_test_worker(60);
         // Control normal.
         let control_job: Job = Box::new(|c: &mut Connection, _ctx: &RequestContext| {
@@ -1198,7 +1196,7 @@ mod tests {
 
     #[tokio::test]
     async fn expire_and_shutdown_guard_windows() {
-        let _support = SupportGuard::enable();
+        let _support = SupportGuard::enable().await;
         let (_dir, worker) = start_test_worker(60);
         worker.expire().await.expect("expire result");
         assert_arm_window("expire", &["normal"]);

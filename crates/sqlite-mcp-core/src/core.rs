@@ -885,6 +885,9 @@ mod tests {
     /// error path, and the protocol envelope is pinned separately).
     #[tokio::test]
     async fn second_begin_returns_transaction_open() {
+        // This pin runs workers whose marker-gated emissions the worker
+        // fixtures count; serialize on the shared test-support lock.
+        let _hooks = crate::test_support::TEST_HOOK_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let core = Core::new(Config::default()).unwrap();
         let (path, _) = core
