@@ -7,6 +7,10 @@ fn enable_hooks() {
 }
 
 async fn setup(config: Config) -> (TempDir, Core, String, String) {
+    // Every test must be self-sufficient: the marker and registry reset
+    // cannot depend on a sibling test having run first (fault-injection and
+    // event-assertion tests call this helper directly).
+    enable_hooks();
     let dir = tempdir().unwrap();
     let core = Core::new(config).unwrap();
     let (path, _) = core
@@ -20,7 +24,6 @@ async fn setup(config: Config) -> (TempDir, Core, String, String) {
 }
 
 async fn table_setup() -> (TempDir, Core, String) {
-    enable_hooks();
     let (dir, core, _path, id) = setup(Config::default()).await;
     core.query(&id, "CREATE TABLE t(x TEXT)", &[])
         .await
