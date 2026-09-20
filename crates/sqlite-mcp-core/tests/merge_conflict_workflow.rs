@@ -29,7 +29,10 @@ async fn import_snapshot(core: &Core, sql_path: &Path, output: &Path, expected_b
         .await
         .unwrap();
 
-    assert_eq!(imported.output_path, output.to_str().unwrap());
+    // The server canonicalizes paths; compare against the canonical form so
+    // symlinked system temp roots (macOS `/var` -> `/private/var`) match.
+    let canonical_output = fs::canonicalize(output).unwrap();
+    assert_eq!(imported.output_path, canonical_output.to_str().unwrap());
     assert_eq!(imported.output_state, "Committed");
     assert_eq!(imported.statement_count, 2, "schema plus one row replay");
     assert_eq!(
