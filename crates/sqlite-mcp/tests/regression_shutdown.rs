@@ -21,14 +21,82 @@ fn stdio_eof_active_query_cleanup() {
 }
 
 #[test]
-fn stdio_sigint_cleanup() {
+#[cfg(unix)]
+fn stdio_sigint_orders_shutdown_and_exits_zero() {
+    // SIGINT must trigger the ordered shutdown path: the shutdown token ends
+    // the serving session, in-flight state is drained, core cleanup rolls back
+    // the open transaction, and the process exits zero (DESIGN §9).
+    let dir = tempdir().unwrap();
+    let db = dir.path().join("sigint.sqlite");
+    {
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        connection
+            .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(a)")
+            .unwrap();
+    }
+    let mut server = support::ServerProcess::spawn();
+    server.initialize();
+    let mut id = 2u64;
+    let handle = support::open_handle(&mut server, &mut id, db.to_str().unwrap());
+    let observe = support::request_tool(
+        &mut server,
+        &mut id,
+        "get_schema",
+        json!({"handle": handle}),
+    );
+    support::assert_ok(&observe);
+    let begin = support::request_tool(
+        &mut server,
+        &mut id,
+        "begin_transaction",
+        json!({"handle": handle, "mode": "deferred"}),
+    );
+    support::assert_ok(&begin);
+    let insert = support::request_tool(
+        &mut server,
+        &mut id,
+        "query",
+        json!({"handle": handle, "sql": "INSERT INTO t VALUES (1)", "parameters": []}),
+    );
+    support::assert_ok(&insert);
+    // Signal SIGINT only after the uncommitted write is confirmed applied.
+    let pid = server.child.id() as i32;
+    let kill = std::process::Command::new("kill")
+        .args(["-INT", &pid.to_string()])
+        .status()
+        .expect("send SIGINT");
+    assert!(kill.success(), "failed to deliver SIGINT");
+    let status = server.wait_bounded(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "SIGINT must exit zero through ordered shutdown: {status}"
+    );
+    let reopened = rusqlite::Connection::open(&db).unwrap();
+    let count: i64 = reopened
+        .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0, "uncommitted row must be absent after SIGINT");
+    let table: String = reopened
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='t'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(table, "t", "committed schema must persist after SIGINT");
+}
+
+#[test]
+fn stdio_sigkill_is_not_graceful() {
+    // SIGKILL bypasses the cooperative shutdown token entirely: no ordered
+    // cleanup runs and the process dies on the signal (nonzero exit).
     let mut server = support::ServerProcess::spawn();
     server.initialize();
     let _ = server.child.kill();
     let status = server.wait_bounded(Duration::from_secs(3));
     assert!(
         !status.success(),
-        "SIGINT/termination unexpectedly successful"
+        "SIGKILL unexpectedly produced a successful exit"
     );
 }
 
@@ -230,4 +298,31 @@ fn shutdown_report_joins_all_failures() {
 #[allow(dead_code)]
 fn _protocol_fixture() {
     let _ = json!({});
+}
+
+#[tokio::test]
+async fn sigint_during_initialization_maps_to_clean_shutdown() {
+    // Cancelling the shutdown token while rmcp initialization is still pending
+    // must be a clean shutdown (exit zero), not an initialization failure. The
+    // test transport never sends the initialize request, so initialization
+    // stays pending until the token fires.
+    let (client, server_transport) = tokio::io::duplex(1024);
+    let ct = tokio_util::sync::CancellationToken::new();
+    let serve = tokio::spawn(sqlite_mcp::serve_with_transport_and_ct(
+        sqlite_mcp_core::Config::default(),
+        server_transport,
+        Some(ct.clone()),
+    ));
+    // Let the serve path reach its pending-initialization state.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    ct.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("serve finishes in time")
+        .expect("serve task");
+    assert!(
+        result.is_ok(),
+        "cancellation during initialization must be a clean shutdown: {result:?}"
+    );
+    drop(client);
 }

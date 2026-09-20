@@ -99,16 +99,26 @@ async fn main() -> ExitCode {
                     cleanup_errors: Vec::new(),
                 })
             });
-            match outcome {
-                Ok(()) => ExitCode::SUCCESS,
+            let code: i32 = match outcome {
+                Ok(()) => 0,
                 Err(failure) => {
                     eprintln!("sqlite-mcp: {failure}");
                     for error in &failure.cleanup_errors {
                         eprintln!("sqlite-mcp: cleanup failure: {error}");
                     }
-                    ExitCode::from(1)
+                    1
                 }
-            }
+            };
+            // Every ordered-cleanup step (service join, transport drain, core
+            // rollback/close/join) has completed above, so the runtime
+            // destructor has no useful work left. Exit explicitly instead of
+            // dropping it: `tokio::io::stdin()` runs its read on the blocking
+            // pool, that read cannot be cancelled, and dropping the runtime
+            // would block forever waiting for it after SIGINT. Flush the
+            // protocol stream first so no buffered stdout is lost.
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            std::process::exit(code);
         }
     }
 }

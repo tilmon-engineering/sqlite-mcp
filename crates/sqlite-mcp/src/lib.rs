@@ -91,13 +91,39 @@ where
             Err(error) => Some(format!("failed to initialize MCP stdio server: {error}")),
         },
         Some(shutdown_ct) => {
-            match rmcp::service::serve_server_with_ct(server, transport, shutdown_ct).await {
-                Ok(running) => running
-                    .waiting()
-                    .await
-                    .err()
-                    .map(|error| format!("MCP stdio server failed: {error}")),
-                Err(error) => Some(format!("failed to initialize MCP stdio server: {error}")),
+            match rmcp::service::serve_server_with_ct(server, transport, shutdown_ct.clone()).await
+            {
+                Ok(running) => {
+                    // rmcp takes the token by value and its service loop
+                    // retains a clone, so cancelling the retained token breaks
+                    // that loop with a bounded response drain and a transport
+                    // close. `waiting(self)` consumes the `RunningService`, so
+                    // build the consuming future once, pin it, and race it
+                    // against the retained token: whichever wins, the pinned
+                    // future is then awaited to completion so the service task
+                    // join (and with it transport teardown) is the barrier
+                    // BEFORE `core.shutdown()` rolls back open handles.
+                    let mut waiting = Box::pin(running.waiting());
+                    let outcome = tokio::select! {
+                        outcome = &mut waiting => outcome,
+                        _ = shutdown_ct.cancelled() => waiting.await,
+                    };
+                    outcome
+                        .err()
+                        .map(|error| format!("MCP stdio server failed: {error}"))
+                }
+                Err(error) => {
+                    // Cancelling during initialization is a clean shutdown
+                    // (rmcp surfaces `ServerInitializeError::Cancelled`), not
+                    // a service failure, so Ctrl-C still exits zero.
+                    if shutdown_ct.is_cancelled()
+                        && matches!(error, rmcp::service::ServerInitializeError::Cancelled)
+                    {
+                        None
+                    } else {
+                        Some(format!("failed to initialize MCP stdio server: {error}"))
+                    }
+                }
             }
         }
     };
