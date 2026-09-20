@@ -170,7 +170,7 @@ fn verify_downloads_success_actual_native_binary() {
     let (dir, binary) = verified_asset_fixture("verify-success");
     let out = xtask(&[
         "verify-downloads",
-        "v0.1.0",
+        "v0.2.0",
         dir.to_str().unwrap(),
         binary.to_str().unwrap(),
     ]);
@@ -193,7 +193,7 @@ fn verify_downloads_corrupt_every_archive_prevents_execution() {
         fs::write(dir.join(format!("sqlite-mcp-{target}.tar.gz")), b"corrupt").unwrap();
         let out = xtask(&[
             "verify-downloads",
-            "v0.1.0",
+            "v0.2.0",
             dir.to_str().unwrap(),
             "/definitely/not-executed",
         ]);
@@ -215,7 +215,7 @@ fn verify_downloads_omitting_every_asset_rejected() {
         fs::remove_file(dir.join(missing)).unwrap();
         let out = xtask(&[
             "verify-downloads",
-            "v0.1.0",
+            "v0.2.0",
             dir.to_str().unwrap(),
             "/definitely/not-executed",
         ]);
@@ -231,7 +231,7 @@ fn verify_downloads_bad_binary() {
     fs::write(&bad, b"not executable").unwrap();
     let out = xtask(&[
         "verify-downloads",
-        "v0.1.0",
+        "v0.2.0",
         dir.to_str().unwrap(),
         bad.to_str().unwrap(),
     ]);
@@ -266,7 +266,7 @@ fn native_archive_rejects_nonexecutable() {
         .to_owned();
     let out = xtask(&[
         "package",
-        "v0.1.0",
+        "v0.2.0",
         &target,
         fake.to_str().unwrap(),
         outdir.to_str().unwrap(),

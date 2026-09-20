@@ -4,6 +4,28 @@ All notable changes are documented here from observed repository history. Releas
 
 Provisional first-release notes were finalized from inspected history spanning root commit `2684862` through implementation commit `e9544c5`; the subsequent notes-only commits are not part of that inspected history.
 
+## [0.2.0] - 2026-09-20
+
+### Added
+
+- Git-independent SQLite merge tools: `extract_sqlite_merge` produces deterministic logical SQL schema snapshots plus sidecar observations for three-way comparison, and `import_sqlite_text` replays a validated SQL image into a new database. Both are explicit-path, bounded, never invoke the SQLite CLI, and never overwrite existing inputs or outputs.
+- Server-owned admission control for long-running work: merge operations are admitted with bounded concurrency, participate in ordered shutdown, and honor per-request cancellation without leaving workspace side effects.
+- Fail-closed SQL authorizer hardening as a documented guarantee: unmapped authorizer actions are denied, schema-qualified `temp.` object access is denied like TEMP objects, `ANALYZE` is denied, top-level `REINDEX` (including `EXPLAIN`-prefixed spellings) is denied, and stored view/trigger bodies containing `pragma_*` table-valued function calls in any identifier quoting are rejected before creation.
+- Per-request enforcement of the configured `busy_wait_ms` bound on every worker command path, with lock exhaustion reported as the retryable `BUSY` error class (including blocked commits, which preserve the open transaction) instead of waiting the full query deadline.
+- Ordered SIGINT shutdown: Ctrl-C now triggers ordered worker shutdown with rollback of open transactions and exits zero, including when cancellation arrives during initialization.
+
+### Fixed
+
+- `begin_transaction` on a handle with an open transaction now reports `TX_ALREADY_OPEN` with truthful, unchanged transaction state instead of an internal error with a raw SQLite message.
+- Result payloads exceeding the configured byte cap now report `RESULT_TOO_LARGE` (previously `INTERNAL`), with the transaction preserved and usable.
+- Affected-row counts (`changes`) are now per-statement: only DML statements report counts; SELECT, DDL, and zero-row DML report zero instead of inheriting the previous statement's count.
+- The documented error-class registry now matches the emitted set exactly, including all eight `MERGE_*` classes, `SERVER_SHUTDOWN`, `INVALID_TRANSACTION_MODE`, and `RESULT_TOO_LARGE`.
+- The release publisher's raw GitHub REST release lookups now decode the snake_case REST fields and paginate the release list correctly, so draft discovery and duplicate-draft recovery work as documented.
+
+### Platform notes
+
+- Platform support and artifact properties are unchanged from 0.1.0: Linux GNU builds use Ubuntu 24.04 and its glibc environment (not musl/static); macOS binaries are unsigned and unnotarized and target macOS 15 runners.
+
 ## [0.1.0] - 2026-09-13
 
 ### Added

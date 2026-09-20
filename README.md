@@ -114,10 +114,10 @@ Published releases provide exactly these four native archives and `SHA256SUMS` (
 
 | Host selection | Rust target | Download |
 |---|---|---|
-| `uname -s` = `Linux`, `uname -m` = `x86_64` | `x86_64-unknown-linux-gnu` | [`sqlite-mcp-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/tilmon-engineering/sqlite-mcp/releases/download/v0.1.0/sqlite-mcp-x86_64-unknown-linux-gnu.tar.gz) |
-| `uname -s` = `Linux`, `uname -m` = `aarch64` | `aarch64-unknown-linux-gnu` | [`sqlite-mcp-aarch64-unknown-linux-gnu.tar.gz`](https://github.com/tilmon-engineering/sqlite-mcp/releases/download/v0.1.0/sqlite-mcp-aarch64-unknown-linux-gnu.tar.gz) |
-| `uname -s` = `Darwin`, `uname -m` = `arm64` | `aarch64-apple-darwin` | [`sqlite-mcp-aarch64-apple-darwin.tar.gz`](https://github.com/tilmon-engineering/sqlite-mcp/releases/download/v0.1.0/sqlite-mcp-aarch64-apple-darwin.tar.gz) |
-| `uname -s` = `Darwin`, `uname -m` = `x86_64` | `x86_64-apple-darwin` | [`sqlite-mcp-x86_64-apple-darwin.tar.gz`](https://github.com/tilmon-engineering/sqlite-mcp/releases/download/v0.1.0/sqlite-mcp-x86_64-apple-darwin.tar.gz) |
+| `uname -s` = `Linux`, `uname -m` = `x86_64` | `x86_64-unknown-linux-gnu` | [`sqlite-mcp-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/tilmon-engineering/sqlite-mcp/releases/download/v0.2.0/sqlite-mcp-x86_64-unknown-linux-gnu.tar.gz) |
+| `uname -s` = `Linux`, `uname -m` = `aarch64` | `aarch64-unknown-linux-gnu` | [`sqlite-mcp-aarch64-unknown-linux-gnu.tar.gz`](https://github.com/tilmon-engineering/sqlite-mcp/releases/download/v0.2.0/sqlite-mcp-aarch64-unknown-linux-gnu.tar.gz) |
+| `uname -s` = `Darwin`, `uname -m` = `arm64` | `aarch64-apple-darwin` | [`sqlite-mcp-aarch64-apple-darwin.tar.gz`](https://github.com/tilmon-engineering/sqlite-mcp/releases/download/v0.2.0/sqlite-mcp-aarch64-apple-darwin.tar.gz) |
+| `uname -s` = `Darwin`, `uname -m` = `x86_64` | `x86_64-apple-darwin` | [`sqlite-mcp-x86_64-apple-darwin.tar.gz`](https://github.com/tilmon-engineering/sqlite-mcp/releases/download/v0.2.0/sqlite-mcp-x86_64-apple-darwin.tar.gz) |
 
 Select by both `uname -s` and `uname -m`; do not infer a target from one value. Linux artifacts are built on Ubuntu 24.04 with GNU/glibc and are not musl/static builds or promises of compatibility with older distributions. macOS artifacts are tested on macOS 15, unsigned, and unnotarized. Gatekeeper may require explicit user approval; do not disable Gatekeeper globally, and no frictionless installation or older-macOS support is promised.
 
@@ -125,7 +125,7 @@ For a specific `VERSION` (for example, `0.1.0`), download anonymously into a fre
 
 ```bash
 set -euo pipefail
-VERSION="0.1.0"
+VERSION="0.2.0"
 TEMP_INSTALL="${TMPDIR:-/tmp}/sqlite-mcp-install-${VERSION}"
 mkdir -p "$TEMP_INSTALL/download" "$TEMP_INSTALL/bin"
 cd "$TEMP_INSTALL/download"
