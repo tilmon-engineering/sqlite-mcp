@@ -2077,8 +2077,14 @@ mod tests {
             .unwrap();
         let owner = ExclusiveOutputOwner::capture(&path, &file).unwrap();
         drop(file);
+        // Build the replacement BEFORE removing the original so its inode is
+        // allocated while the captured inode is still live (tmpfs-style
+        // filesystems otherwise reuse the freed inode number), then move it
+        // over the path. The owner must refuse to remove the replaced file.
+        let replacement = dir.path().join("replacement.sqlite");
+        fs::write(&replacement, b"replacement").unwrap();
         fs::remove_file(&path).unwrap();
-        fs::write(&path, b"replacement").unwrap();
+        fs::rename(&replacement, &path).unwrap();
         assert!(owner.remove_if_owned().is_err());
         assert!(path.exists());
     }
