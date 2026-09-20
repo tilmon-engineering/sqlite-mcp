@@ -336,6 +336,11 @@ impl<'a> Cursor<'a> {
             }
         }
     }
+    /// Advance one token. Tokens split at any character that cannot be part
+    /// of an unquoted SQLite identifier (identifiers allow alphanumerics,
+    /// `_`, `$`, and non-ASCII), so a comment or operator adjacent to a
+    /// keyword terminates the keyword instead of merging into it —
+    /// `REINDEX/**/x` tokenizes as `REINDEX`.
     fn next(&mut self) -> Option<&'a str> {
         self.skip_trivia();
         if self.rest.is_empty() {
@@ -343,8 +348,16 @@ impl<'a> Cursor<'a> {
         }
         let end = self
             .rest
-            .find(|c: char| c.is_whitespace() || c == ';' || c == '(')
+            .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
             .unwrap_or(self.rest.len());
+        if end == 0 {
+            // A non-identifier character in first position (an operator,
+            // quote, or punctuation) is consumed as a single-token delimiter
+            // so the scanner always makes progress.
+            let (word, remainder) = self.rest.split_at(1);
+            self.rest = remainder;
+            return Some(word);
+        }
         let (word, remainder) = self.rest.split_at(end);
         self.rest = remainder;
         Some(word)
@@ -746,6 +759,15 @@ mod tests {
             "  REINDEX",
             "-- leading comment\nREINDEX",
             "/* c */ ANALYZE",
+            // Comments adjacent to the keyword must not merge into the
+            // first token (SQLite treats them as trivia).
+            "REINDEX/**/x",
+            "REINDEX/*comment*/x",
+            "REINDEX/**/",
+            "REINDEX-- trailing\nx",
+            "ANALYZE/**/",
+            "ANALYZE/*c*/main.t",
+            "ANALYZE--c\n",
         ] {
             assert!(
                 check_maintenance(sql).is_err(),

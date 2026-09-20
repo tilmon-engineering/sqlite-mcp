@@ -105,7 +105,18 @@ async fn analyze_and_reindex_denied() {
     core.query(&id, "CREATE INDEX i ON t(a)", &[])
         .await
         .expect("setup index");
-    for sql in ["ANALYZE", "REINDEX main.t", "REINDEX"] {
+    for sql in [
+        "ANALYZE",
+        "REINDEX main.t",
+        "REINDEX",
+        // Adjacent-comment spellings are valid SQLite and must be denied
+        // before execution (the authorizer cannot catch REINDEX).
+        "REINDEX/**/i",
+        "REINDEX/*c*/i",
+        "REINDEX/**/",
+        "ANALYZE/**/",
+        "ANALYZE/*c*/main.t",
+    ] {
         let err = core
             .query(&id, sql, &[])
             .await
