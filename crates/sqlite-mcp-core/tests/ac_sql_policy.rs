@@ -194,19 +194,25 @@ async fn stored_body_guard_accepts_pragma_named_identifiers() {
     core.query(&id, "CREATE VIEW v([x(]) AS SELECT 1", &[])
         .await
         .expect("bracket-quoted column list must be allowed");
+    // Bare pragma_-containing aliases and column names are legitimate (R4-1).
+    core.query(&id, "CREATE VIEW alias_v AS SELECT 1 AS pragma_alias", &[])
+        .await
+        .expect("pragma_-containing column alias must be allowed");
     core.query(&id, "SELECT * FROM \"a-b-pragma_x\"", &[])
         .await
         .expect("the created view is readable");
-    // A real unquoted pragma table-valued reference in a stored body is
-    // still rejected — including behind a bracket-quoted column list, which
-    // must not hide the body from the scan (R3-1 bypass).
+    // A pragma table-valued function CALL in a stored body is rejected —
+    // including quoted call spellings, which SQLite accepts (R4-2), and
+    // behind a bracket-quoted column list (R3-1 bypass).
     for sql in [
         "CREATE VIEW bad AS SELECT * FROM pragma_table_info('t')",
-        "CREATE VIEW bad_bracket AS SELECT * FROM pragma_table_info('t') -- x",
+        "CREATE VIEW bad_q AS SELECT * FROM \"pragma_table_info\"('t')",
+        "CREATE VIEW bad_b AS SELECT * FROM `pragma_table_info`('t')",
+        "CREATE VIEW bad_k AS SELECT * FROM [pragma_table_info]('t')",
         "CREATE VIEW v([x(]) AS SELECT * FROM pragma_table_info('t')",
     ] {
         let result = core.query(&id, sql, &[]).await;
-        let err = result.expect_err("pragma reference in stored body must be denied");
+        let err = result.expect_err("pragma TVF call in stored body must be denied");
         assert!(
             err.to_string().contains("denied by SQL policy"),
             "unexpected denial shape for {sql}: {err}"

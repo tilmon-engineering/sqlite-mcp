@@ -558,66 +558,148 @@ pub fn check_stored_body(sql: &str, mutation_seen: &MutationSignal) -> Result<()
         cursor.skip_word_if("exists");
         cursor.skip_object_name();
         cursor.skip_parenthesized();
-        if contains_unquoted_pragma_ref(cursor.rest) {
+        if contains_pragma_table_valued_call(cursor.rest) {
             return Err(PolicyError::Denied);
         }
     }
     Ok(())
 }
 
-/// True when `text` contains a `pragma_` reference outside quoted
-/// identifiers, string literals, and SQL comments. Quoted segments (`"…"`,
-/// `` `…` ``, `[…]`, `'…'`, with doubled-quote escapes) and comment text
-/// cannot execute a pragma table-valued function, so their contents are
-/// skipped.
-fn contains_unquoted_pragma_ref(text: &str) -> bool {
-    let mut unquoted = String::new();
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' | '`' | '\'' => {
-                while let Some(inner) = chars.next() {
-                    if inner == c {
-                        if chars.peek() == Some(&c) {
-                            chars.next();
+/// True when `text` contains a `pragma_*` table-valued function CALL: an
+/// identifier (quoted in any SQLite style — `"…"`, `` `…` ``, `[…]` — or
+/// unquoted) whose normalized name starts with `pragma_`, immediately
+/// followed (after whitespace/comments) by `(`. Quoted names are NOT
+/// skipped here because SQLite accepts quoted identifiers in function-call
+/// position; string literals and comments are inert and skipped. A bare
+/// `pragma_`-containing identifier without a call (a column alias or name)
+/// is legitimate and allowed.
+fn contains_pragma_table_valued_call(text: &str) -> bool {
+    let cs: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    while i < cs.len() {
+        match cs[i] {
+            '"' | '`' => {
+                let quote = cs[i];
+                i += 1;
+                let mut name = String::new();
+                let mut terminated = false;
+                while i < cs.len() {
+                    if cs[i] == quote {
+                        if i + 1 < cs.len() && cs[i + 1] == quote {
+                            name.push(quote);
+                            i += 2;
                         } else {
+                            i += 1;
+                            terminated = true;
                             break;
                         }
+                    } else {
+                        name.push(cs[i]);
+                        i += 1;
                     }
+                }
+                if terminated
+                    && is_call_position(&cs, &mut i)
+                    && name.to_ascii_lowercase().starts_with("pragma_")
+                {
+                    return true;
                 }
             }
             '[' => {
-                for inner in chars.by_ref() {
-                    if inner == ']' {
+                i += 1;
+                let mut name = String::new();
+                let mut terminated = false;
+                while i < cs.len() {
+                    if cs[i] == ']' {
+                        i += 1;
+                        terminated = true;
                         break;
                     }
+                    name.push(cs[i]);
+                    i += 1;
+                }
+                if terminated
+                    && is_call_position(&cs, &mut i)
+                    && name.to_ascii_lowercase().starts_with("pragma_")
+                {
+                    return true;
                 }
             }
-            '-' if chars.peek() == Some(&'-') => {
-                chars.next();
-                for inner in chars.by_ref() {
-                    if inner == '\n' {
-                        break;
-                    }
-                }
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                loop {
-                    match chars.next() {
-                        Some('*') if chars.peek() == Some(&'/') => {
-                            chars.next();
+            '\'' => {
+                i += 1;
+                while i < cs.len() {
+                    if cs[i] == '\'' {
+                        if i + 1 < cs.len() && cs[i + 1] == '\'' {
+                            i += 2;
+                        } else {
+                            i += 1;
                             break;
                         }
-                        Some(_) => {}
-                        None => break,
+                    } else {
+                        i += 1;
                     }
                 }
             }
-            _ => unquoted.extend(c.to_lowercase()),
+            '-' if i + 1 < cs.len() && cs[i + 1] == '-' => {
+                i += 2;
+                while i < cs.len() && cs[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if i + 1 < cs.len() && cs[i + 1] == '*' => {
+                i += 2;
+                while i + 1 < cs.len() && !(cs[i] == '*' && cs[i + 1] == '/') {
+                    i += 1;
+                }
+                i = (i + 2).min(cs.len());
+            }
+            c if c.is_alphabetic() || c == '_' || c == '$' => {
+                let mut name = String::new();
+                name.push(c);
+                i += 1;
+                while i < cs.len() && (cs[i].is_alphanumeric() || cs[i] == '_' || cs[i] == '$') {
+                    name.push(cs[i]);
+                    i += 1;
+                }
+                if is_call_position(&cs, &mut i) && name.to_ascii_lowercase().starts_with("pragma_")
+                {
+                    return true;
+                }
+            }
+            _ => {
+                i += 1;
+            }
         }
     }
-    unquoted.contains("pragma_")
+    false
+}
+
+/// Whether the current position (after advancing past trivia) is a call
+/// position: an opening parenthesis, making the just-consumed identifier a
+/// function name.
+fn is_call_position(cs: &[char], i: &mut usize) -> bool {
+    loop {
+        while *i < cs.len() && cs[*i].is_whitespace() {
+            *i += 1;
+        }
+        if *i + 1 < cs.len() && cs[*i] == '-' && cs[*i + 1] == '-' {
+            *i += 2;
+            while *i < cs.len() && cs[*i] != '\n' {
+                *i += 1;
+            }
+            continue;
+        }
+        if *i + 1 < cs.len() && cs[*i] == '/' && cs[*i + 1] == '*' {
+            *i += 2;
+            while *i + 1 < cs.len() && !(cs[*i] == '*' && cs[*i + 1] == '/') {
+                *i += 1;
+            }
+            *i = (*i + 2).min(cs.len());
+            continue;
+        }
+        break;
+    }
+    *i < cs.len() && cs[*i] == '('
 }
 #[cfg(test)]
 pub fn unknown_action_denied() -> bool {
@@ -1004,14 +1086,19 @@ mod tests {
         }
     }
 
-    /// The stored-body structural guard is quoted-identifier and string
-    /// literal aware: object names and quoted body text containing
-    /// `pragma_` cannot cause a false denial, while real unquoted pragma
-    /// table-valued references in the body are still rejected (R2-1).
+    /// The stored-body structural guard detects pragma table-valued function
+    /// CALLS in any identifier quoting, while bare `pragma_`-containing
+    /// names, aliases, comments, and string literals pass (R2-1/R3/R4).
     #[test]
-    fn stored_body_guard_is_quoted_aware() {
+    fn stored_body_guard_targets_calls_not_names() {
         let signal = MutationSignal::new();
         for sql in [
+            // Bare pragma_-containing identifiers without a call are
+            // legitimate names and aliases (R4-1).
+            "CREATE VIEW alias_v AS SELECT 1 AS pragma_alias",
+            "CREATE VIEW c AS SELECT pragma_x FROM t",
+            "CREATE VIEW q2 AS SELECT * FROM \"some_view\"",
+            // Quoted identifiers in NON-call position are names (R2-1/R3-3).
             "CREATE VIEW \"a-b-pragma_x\" AS SELECT 1",
             "CREATE VIEW \"weird-name\" AS SELECT 1",
             "CREATE VIEW `back-pragma_x` AS SELECT 1",
@@ -1020,16 +1107,13 @@ mod tests {
             "CREATE VIEW v AS SELECT \"pragma_x\"",
             "CREATE TRIGGER \"t-pragma_x\" AFTER INSERT ON t BEGIN SELECT 1; END",
             "CREATE VIEW IF NOT EXISTS \"a-b-pragma_x\" AS SELECT 1",
-            // Schema-qualified names (R3-3): the qualified name is consumed
-            // as an object name, not scanned as body text.
             "CREATE VIEW main.pragma_view AS SELECT 1",
             "CREATE TRIGGER main.pragma_trigger AFTER INSERT ON t BEGIN SELECT 1; END",
             "CREATE VIEW main.\"x-pragma_view2\" AS SELECT 1",
-            // Comment text cannot execute a pragma reference (R3-2).
+            // Comment text is inert (R3-2).
             "CREATE VIEW v_comment AS SELECT 1 /* pragma_table_info */",
             "CREATE VIEW v_line AS SELECT 1 -- pragma_table_info\n",
-            // A bracket-quoted column list containing parentheses is one
-            // component (R3-1).
+            // Bracket-quoted column lists are single components (R3-1).
             "CREATE VIEW v([x(]) AS SELECT 1",
         ] {
             assert!(
@@ -1038,22 +1122,30 @@ mod tests {
             );
         }
         for sql in [
+            // Unquoted TVF calls (the original contract).
             "CREATE VIEW pv AS SELECT * FROM pragma_table_info('t')",
             "CREATE/**/VIEW bv AS SELECT * FROM pragma_table_info('t')",
             "CREATE VIEW/**/bv AS SELECT * FROM pragma_table_info('t')",
             "CREATE VIEW v(x) AS SELECT * FROM pragma_table_info('t')",
             "CREATE TRIGGER g AFTER INSERT ON t BEGIN SELECT * FROM pragma_table_info('t'); END",
             "CREATE TEMP VIEW tv AS SELECT * FROM pragma_table_info('t')",
-            // The R3-1 bypass: a bracket-quoted column list must not hide the
-            // body's pragma reference.
-            "CREATE VIEW v([x(]) AS SELECT * FROM pragma_table_info('t')",
-            // A comment does not neutralize a real reference elsewhere.
+            // Quoted identifiers ARE callable in SQLite (R4-2): every quote
+            // style in call position must be denied.
+            "CREATE VIEW q AS SELECT * FROM \"pragma_table_info\"('t')",
+            "CREATE VIEW qb AS SELECT * FROM `pragma_table_info`('t')",
+            "CREATE VIEW qk AS SELECT * FROM [pragma_table_info]('t')",
+            // Whitespace or a comment between name and paren is still a call.
+            "CREATE VIEW qs AS SELECT * FROM pragma_table_info ('t')",
+            "CREATE VIEW qc AS SELECT * FROM pragma_table_info/*x*/('t')",
+            "CREATE VIEW qd AS SELECT * FROM \"pragma_\"\"x\"('t')",
+            // A comment does not neutralize a real call elsewhere.
             "CREATE VIEW v2 AS SELECT 1 /* pragma_x */ , (SELECT * FROM pragma_table_info('t'))",
             "CREATE VIEW v3 AS SELECT 1 -- pragma_x\n, (SELECT * FROM pragma_table_info('t'))",
+            "CREATE VIEW v([x(]) AS SELECT * FROM pragma_table_info('t')",
         ] {
             assert!(
                 check_stored_body(sql, &signal).is_err(),
-                "stored body with pragma reference accepted: {sql:?}"
+                "stored body with pragma table-valued call accepted: {sql:?}"
             );
         }
     }
