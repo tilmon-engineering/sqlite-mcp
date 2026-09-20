@@ -472,6 +472,9 @@ pub fn reset_registry() {
     if let Ok(mut faults) = faults().lock() {
         faults.clear();
     }
+    if let Ok(mut fault) = commit_fault().lock() {
+        *fault = None;
+    }
     set_clock_ms(0);
 }
 
@@ -507,6 +510,39 @@ pub fn take_cleanup_fault(stage: crate::operation::CleanupStage) -> Option<Clean
         .lock()
         .expect("test-support fault registry poisoned")
         .remove(&format!("{stage:?}"))
+}
+
+/// One-shot commit fault modes used only by Rust tests. The worker consumes the
+/// mode at the commit boundary and still probes SQLite on the same worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitFault {
+    OpenContinuable,
+    AutocommitRestoredUnconfirmed,
+    AutocommitRestored,
+    Uncertain,
+}
+
+static COMMIT_FAULT: OnceLock<Mutex<Option<CommitFault>>> = OnceLock::new();
+fn commit_fault() -> &'static Mutex<Option<CommitFault>> {
+    COMMIT_FAULT.get_or_init(|| Mutex::new(None))
+}
+
+pub fn inject_commit_fault(fault: CommitFault) {
+    if enabled() {
+        *commit_fault()
+            .lock()
+            .expect("test-support commit fault registry poisoned") = Some(fault);
+    }
+}
+
+pub(crate) fn take_commit_fault() -> Option<CommitFault> {
+    if !enabled() {
+        return None;
+    }
+    commit_fault()
+        .lock()
+        .expect("test-support commit fault registry poisoned")
+        .take()
 }
 
 #[cfg(test)]

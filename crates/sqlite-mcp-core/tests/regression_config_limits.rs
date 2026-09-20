@@ -4,7 +4,7 @@ use sqlite_mcp_core::{Cell, Config, Core};
 use std::collections::BTreeSet;
 use tempfile::tempdir;
 
-const FIELDS: [(&str, u64); 15] = [
+const FIELDS: [(&str, u64); 19] = [
     ("max_handles", 1024),
     ("queue_capacity", 4096),
     ("query_timeout_ms", 300_000),
@@ -20,6 +20,10 @@ const FIELDS: [(&str, u64); 15] = [
     ("parameter_limit", 32_766),
     ("expression_depth", 1000),
     ("compound_terms", 500),
+    ("merge_text_byte_limit", 67_108_864),
+    ("merge_statement_limit", 1_000_000),
+    ("merge_source_observation_byte_limit", 1_073_741_824),
+    ("merge_image_byte_limit", 1_073_741_824),
 ];
 
 fn config_with(field: &str, setting: u64) -> Config {
@@ -118,7 +122,7 @@ async fn configured_parameter_limit_single_source() {
 #[test]
 fn documented_config_bounds_match_policy() {
     // The documented bounds (DESIGN.md) must equal the enforced policy table
-    // in config.rs for all 15 fields; a documentation/policy drift fails here.
+    // in config.rs for all serialized fields; a documentation/policy drift fails here.
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let root = std::path::Path::new(&manifest)
         .parent()
@@ -146,6 +150,10 @@ fn documented_config_bounds_match_policy() {
         ("parameter_limit", 32_766),
         ("expression_depth", 1000),
         ("compound_terms", 500),
+        ("merge_text_byte_limit", 67_108_864),
+        ("merge_statement_limit", 1_000_000),
+        ("merge_source_observation_byte_limit", 1_073_741_824),
+        ("merge_image_byte_limit", 1_073_741_824),
     ];
     for (field, max) in expected {
         // Policy row exists with this exact maximum: match the field, then

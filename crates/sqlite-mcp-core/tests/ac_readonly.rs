@@ -53,8 +53,6 @@ async fn transaction_persistence_and_modes() {
     core.get_schema(&h.id).await.unwrap();
     core.begin_transaction(&h.id, "deferred").await.unwrap();
     core.query(&h.id, "CREATE TABLE t(a)", &[]).await.unwrap();
-    // Re-observe after local DDL before further statements.
-    core.get_schema(&h.id).await.unwrap();
     core.query(
         &h.id,
         "INSERT INTO t VALUES (?)",

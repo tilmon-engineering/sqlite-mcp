@@ -156,17 +156,12 @@ async fn schema_snapshot_freshness_and_gate() {
     core.query(&id, "CREATE TABLE local_rollback(x)", &[])
         .await
         .unwrap();
-    // F-06 contract: attempted local DDL invalidates the observation, so the
-    // gate rejects the next query with SCHEMA_REQUIRED (previously the stale
-    // class; invalidation replaces version-bump-only semantics).
-    assert!(matches!(
-        core.query(&id, "SELECT 1", &[]).await,
-        Err(CoreError::SchemaRequired)
-    ));
+    // Actual local DDL updates only the transaction-local expected cookie;
+    // subsequent statements in the same transaction remain usable.
+    assert!(core.query(&id, "SELECT 1", &[]).await.is_ok());
     core.rollback(&id).await.unwrap();
-    // Attempted local DDL invalidated the observation; re-observe before the
-    // next begin.
-    core.get_schema(&id).await.unwrap();
+    // Rollback restores the prior committed observation without requiring an
+    // intermediate schema reread.
     core.begin_transaction(&id, "deferred").await.unwrap();
     let rolled_back = core
         .query(
@@ -178,14 +173,13 @@ async fn schema_snapshot_freshness_and_gate() {
         .unwrap();
     assert!(rolled_back.rows.is_empty());
     core.rollback(&id).await.unwrap();
-    core.get_schema(&id).await.unwrap();
     let h = core
         .list_handles()
         .await
         .into_iter()
         .find(|h| h.id == id)
         .unwrap();
-    assert!(h.observation_generation >= 4);
+    assert_eq!(h.observation_generation, 3);
     core.shutdown().await;
     drop(dir);
 }

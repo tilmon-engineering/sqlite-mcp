@@ -29,15 +29,14 @@ async fn cross_cluster_lifecycle_query_scenarios() {
     core.query(&id, "CREATE TABLE t(a INTEGER)", &[])
         .await
         .unwrap();
-    core.get_schema(&id).await.unwrap();
     core.commit(&id).await.unwrap();
+    core.get_schema(&id).await.unwrap();
     core.begin_transaction(&id, "deferred").await.unwrap();
     core.query(&id, "INSERT INTO t VALUES (7)", &[])
         .await
         .unwrap();
-    // Local DML invalidated the observation; re-observe, then expire the
-    // idle transaction via the injected clock.
-    core.get_schema(&id).await.unwrap();
+    // Successful DML does not invalidate the committed observation; expire
+    // the idle transaction via the injected clock.
     sqlite_mcp_core::test_support::set_clock_ms(u64::MAX / 2);
     let expired = core.expire_handle(&id).await.unwrap();
     assert!(expired, "open transaction expires");
@@ -59,7 +58,6 @@ async fn cross_cluster_lifecycle_query_scenarios() {
     core.query(&id2, "INSERT INTO t VALUES (7)", &[])
         .await
         .unwrap();
-    core.get_schema(&id2).await.unwrap();
     core.commit(&id2).await.unwrap();
     // Rollback remains idempotent-success for the now-idle handle (preserved
     // contract); the persistence check below is the real assertion.
@@ -78,7 +76,6 @@ async fn cross_cluster_lifecycle_query_scenarios() {
     core.query(&id2, "INSERT INTO t VALUES (8)", &[])
         .await
         .unwrap();
-    core.get_schema(&id2).await.unwrap();
     core.commit(&id2).await.unwrap();
     // Verify independent persistence through a separate connection.
     let check = rusqlite::Connection::open(&created_path).unwrap();

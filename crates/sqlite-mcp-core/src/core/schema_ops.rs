@@ -242,16 +242,22 @@ impl Core {
             return Err(CoreError::SchemaTooLarge);
         }
         let mut s = self.inner.lock().await;
-        let Some((h, _)) = s.handles.get_mut(id) else {
-            // The registry entry vanished (global shutdown or invalidation
-            // raced this publication): there is nothing left to publish onto.
-            // Report unknown rather than panicking.
-            return Err(CoreError::UnknownHandle);
-        };
-        h.schema_observed = true;
-        h.schema_version = schema.schema_version;
-        h.observation_generation = h.observation_generation.saturating_add(1);
-        h.expired = false;
+        if s.transaction_schema.contains_key(id) {
+            // Active-transaction schema reads are coherent result snapshots,
+            // not public committed observations. Keep the public handle state
+            // unchanged and retain the result as a transaction-local overlay.
+            if let Some(tx) = s.transaction_schema.get_mut(id) {
+                tx.overlay = Some(schema.clone());
+            }
+        } else {
+            let Some((h, _)) = s.handles.get_mut(id) else {
+                return Err(CoreError::UnknownHandle);
+            };
+            h.schema_observed = true;
+            h.schema_version = schema.schema_version;
+            h.observation_generation = h.observation_generation.saturating_add(1);
+            h.expired = false;
+        }
         Ok(schema)
     }
 }

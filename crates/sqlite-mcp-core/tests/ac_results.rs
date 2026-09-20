@@ -15,8 +15,6 @@ async fn typed_value_roundtrip() {
     core.query(&h.id, "CREATE TABLE t(i, n, s, b)", &[])
         .await
         .unwrap();
-    // Re-observe after local DDL before further statements.
-    core.get_schema(&h.id).await.unwrap();
     let blob = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0x80u8, 0xff]);
     core.query(
         &h.id,
@@ -30,8 +28,6 @@ async fn typed_value_roundtrip() {
     )
     .await
     .unwrap();
-    // Re-observe after the invalidating DML before further queries.
-    core.get_schema(&h.id).await.unwrap();
     let r = core
         .query(
             &h.id,
@@ -76,15 +72,11 @@ async fn result_caps_and_changes() {
     core.begin_transaction(&h.id, "deferred").await.unwrap();
     let ddl = core.query(&h.id, "CREATE TABLE t(a)", &[]).await.unwrap();
     assert_eq!(ddl.changes, 0);
-    // Re-observe after local DDL before further statements.
-    core.get_schema(&h.id).await.unwrap();
     let ins = core
         .query(&h.id, "INSERT INTO t VALUES (1),(2),(3)", &[])
         .await
         .unwrap();
     assert_eq!(ins.changes, 3);
-    // Re-observe after the invalidating DML before further queries.
-    core.get_schema(&h.id).await.unwrap();
     let sel = core.query(&h.id, "SELECT a FROM t", &[]).await.unwrap();
     assert_eq!(sel.changes, 0);
     assert_eq!(sel.rows_returned, 2);

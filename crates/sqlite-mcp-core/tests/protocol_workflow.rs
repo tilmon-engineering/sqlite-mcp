@@ -44,12 +44,8 @@ async fn documented_workflow_scenario() {
             .await,
         false,
     );
-    // Transaction-local DDL invalidates the observation; re-observe (as the
-    // README workflow documents) before further statements.
-    assert_envelope(
-        &fixture.call("get_schema", json!({"handle": id})).await,
-        false,
-    );
+    // Actual DDL remains usable for subsequent statements in the same
+    // transaction; one schema reread is needed only after its commit.
     assert_envelope(
         &fixture
             .call(
@@ -63,12 +59,17 @@ async fn documented_workflow_scenario() {
             .await,
         false,
     );
-    assert_envelope(&fixture.call("commit", json!({"handle": id})).await, false);
+    let committed = fixture.call("commit", json!({"handle": id})).await;
+    let committed_value = assert_envelope(&committed, false);
+    assert_eq!(committed_value["handle_state"]["schema_observed"], false);
+    assert_envelope(
+        &fixture.call("get_schema", json!({"handle": id})).await,
+        false,
+    );
 
     // Failed-call recovery (F-13): close is refused while a transaction is
     // active, reporting the authoritative state and the exact recovery moves.
-    // The commit invalidated the observation, so re-observe first (the
-    // documented recovery for invalidated handles).
+    // The actual schema change committed, so reread once before the next begin.
     assert_envelope(
         &fixture.call("get_schema", json!({"handle": id})).await,
         false,

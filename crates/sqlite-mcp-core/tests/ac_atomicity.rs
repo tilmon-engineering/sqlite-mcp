@@ -14,8 +14,6 @@ async fn setup() -> (tempfile::TempDir, Core, String) {
     core.query(&h.id, "CREATE TABLE t(a INTEGER UNIQUE)", &[])
         .await
         .unwrap();
-    // Transaction-local DDL invalidates the observation; re-observe.
-    core.get_schema(&h.id).await.unwrap();
     core.query(&h.id, "INSERT INTO t VALUES (1),(2),(3)", &[])
         .await
         .unwrap();
@@ -44,13 +42,10 @@ async fn outer_rollback_reporting_and_ddl_rollback() {
     core.get_schema(&id).await.unwrap();
     core.begin_transaction(&id, "deferred").await.unwrap();
     core.query(&id, "CREATE TABLE t2(x)", &[]).await.unwrap();
-    // Re-observe after local DDL before the next statement.
-    core.get_schema(&id).await.unwrap();
     core.query(&id, "ALTER TABLE t2 ADD COLUMN y", &[])
         .await
         .unwrap();
     core.rollback(&id).await.unwrap();
-    core.get_schema(&id).await.unwrap();
     let schema = core.get_schema(&id).await.unwrap();
     assert!(!schema.objects.iter().any(|o| o.name == "t2"));
     core.begin_transaction(&id, "deferred").await.unwrap();
@@ -78,8 +73,6 @@ async fn returning_completion_under_caps() {
     core.get_schema(&h.id).await.unwrap();
     core.begin_transaction(&h.id, "deferred").await.unwrap();
     core.query(&h.id, "CREATE TABLE t(a)", &[]).await.unwrap();
-    // Re-observe after local DDL before the next statement.
-    core.get_schema(&h.id).await.unwrap();
     let r = core
         .query(&h.id, "INSERT INTO t VALUES (1),(2),(3) RETURNING a", &[])
         .await

@@ -1,10 +1,8 @@
-use sqlite_mcp_core::{Cell, Config, Core, CoreError};
+use sqlite_mcp_core::{Cell, Config, Core};
 use tempfile::{TempDir, tempdir};
 
 fn enable_hooks() {
     unsafe { std::env::set_var("SQLITE_MCP_TEST_SUPPORT", "1") };
-    // Clear stale arms/records from earlier tests: an armed gate that outlived
-    // its test would otherwise park unrelated workers' emits here.
     sqlite_mcp_core::test_support::reset_registry();
 }
 
@@ -27,92 +25,278 @@ async fn table_setup() -> (TempDir, Core, String) {
     core.query(&id, "CREATE TABLE t(x TEXT)", &[])
         .await
         .unwrap();
-    core.get_schema(&id).await.unwrap();
     (dir, core, id)
 }
 
-/// Serializes tests that use the process-global hook state (fault registry,
-/// marker, event registry) so parallel tests cannot steal each other's
-/// injected faults or arms.
+/// Serializes tests using the process-global event/fault hooks.
 static HOOK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
-async fn failed_ddl_invalidates_immediately() {
+async fn multiple_in_transaction_schema_and_data_queries() {
     let _hooks = HOOK_LOCK.lock().await;
-    let (_d, core, id) = table_setup().await;
+    let (_dir, core, _path, id) = setup(Config::default()).await;
+    core.query(&id, "CREATE TABLE first(value INTEGER)", &[])
+        .await
+        .unwrap();
+    core.query(&id, "CREATE TABLE second(value INTEGER)", &[])
+        .await
+        .unwrap();
+    core.query(&id, "INSERT INTO first VALUES (1)", &[])
+        .await
+        .unwrap();
+    let selected = core
+        .query(&id, "SELECT value FROM first", &[])
+        .await
+        .unwrap();
+    assert_eq!(selected.rows[0][0], Cell::Integer("1".into()));
+    core.commit(&id).await.unwrap();
+    assert!(!core.list_handles().await[0].schema_observed);
+    let schema = core.get_schema(&id).await.unwrap();
+    assert!(schema.objects.iter().any(|object| object.name == "first"));
+    assert!(schema.objects.iter().any(|object| object.name == "second"));
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn successful_dml_does_not_invalidate_observation() {
+    let _hooks = HOOK_LOCK.lock().await;
+    let (_dir, core, id) = table_setup().await;
+    let before = core
+        .list_handles()
+        .await
+        .into_iter()
+        .find(|h| h.id == id)
+        .unwrap();
+    core.query(&id, "INSERT INTO t VALUES ('one')", &[])
+        .await
+        .unwrap();
+    let after = core
+        .list_handles()
+        .await
+        .into_iter()
+        .find(|h| h.id == id)
+        .unwrap();
+    assert!(after.schema_observed);
+    assert_eq!(after.schema_version, before.schema_version);
+    assert_eq!(after.observation_generation, before.observation_generation);
+    assert!(core.query(&id, "SELECT count(*) FROM t", &[]).await.is_ok());
+    core.rollback(&id).await.unwrap();
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn successful_noop_ddl_retains_observation() {
+    let _hooks = HOOK_LOCK.lock().await;
+    let (_dir, core, _path, id) = setup(Config::default()).await;
+    core.query(&id, "CREATE TABLE baseline(x TEXT)", &[])
+        .await
+        .unwrap();
+    core.commit(&id).await.unwrap();
+    core.get_schema(&id).await.unwrap();
+    core.begin_transaction(&id, "deferred").await.unwrap();
+    let before = core
+        .list_handles()
+        .await
+        .into_iter()
+        .find(|h| h.id == id)
+        .unwrap();
+    core.query(&id, "CREATE TABLE IF NOT EXISTS baseline(x TEXT)", &[])
+        .await
+        .unwrap();
+    core.query(&id, "DROP TABLE IF EXISTS missing", &[])
+        .await
+        .unwrap();
+    let after = core
+        .list_handles()
+        .await
+        .into_iter()
+        .find(|h| h.id == id)
+        .unwrap();
+    assert!(after.schema_observed);
+    assert_eq!(after.schema_version, before.schema_version);
+    assert_eq!(after.observation_generation, before.observation_generation);
+    core.commit(&id).await.unwrap();
+    let begin = core.begin_transaction(&id, "deferred").await;
+    assert!(begin.is_ok(), "no-op DDL begin failed: {begin:?}");
+    core.rollback(&id).await.unwrap();
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn active_transaction_schema_result_does_not_promote_handle_state() {
+    let _hooks = HOOK_LOCK.lock().await;
+    let (_dir, core, _path, id) = setup(Config::default()).await;
+    let before = core
+        .list_handles()
+        .await
+        .into_iter()
+        .find(|h| h.id == id)
+        .unwrap();
+    core.query(&id, "CREATE TABLE uncommitted(value TEXT)", &[])
+        .await
+        .unwrap();
+    let schema = core.get_schema(&id).await.unwrap();
+    assert!(
+        schema
+            .objects
+            .iter()
+            .any(|object| object.name == "uncommitted")
+    );
+    let during = core
+        .list_handles()
+        .await
+        .into_iter()
+        .find(|h| h.id == id)
+        .unwrap();
+    assert_eq!(during.schema_observed, before.schema_observed);
+    assert_eq!(during.schema_version, before.schema_version);
+    assert_eq!(during.observation_generation, before.observation_generation);
+    core.rollback(&id).await.unwrap();
+    assert!(core.begin_transaction(&id, "deferred").await.is_ok());
+    let absent = core
+        .query(
+            &id,
+            "SELECT name FROM sqlite_schema WHERE name = 'uncommitted'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(absent.rows.is_empty());
+    core.rollback(&id).await.unwrap();
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn actual_ddl_commit_requires_one_post_commit_schema_read() {
+    let _hooks = HOOK_LOCK.lock().await;
+    let (_dir, core, _path, id) = setup(Config::default()).await;
+    let before = core
+        .list_handles()
+        .await
+        .into_iter()
+        .find(|h| h.id == id)
+        .unwrap();
+    core.query(&id, "CREATE TABLE committed(value INTEGER)", &[])
+        .await
+        .unwrap();
+    core.commit(&id).await.unwrap();
+    let invalidated = core
+        .list_handles()
+        .await
+        .into_iter()
+        .find(|h| h.id == id)
+        .unwrap();
+    assert!(!invalidated.schema_observed);
+    assert_eq!(
+        invalidated.observation_generation,
+        before.observation_generation + 1
+    );
+    assert!(core.begin_transaction(&id, "deferred").await.is_err());
+    let schema = core.get_schema(&id).await.unwrap();
+    assert!(
+        schema
+            .objects
+            .iter()
+            .any(|object| object.name == "committed")
+    );
+    let observed = core
+        .list_handles()
+        .await
+        .into_iter()
+        .find(|h| h.id == id)
+        .unwrap();
+    assert!(observed.schema_observed);
+    assert_eq!(
+        observed.observation_generation,
+        invalidated.observation_generation + 1
+    );
+    assert!(core.begin_transaction(&id, "deferred").await.is_ok());
+    core.rollback(&id).await.unwrap();
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn rollback_of_local_ddl_keeps_observation() {
+    let _hooks = HOOK_LOCK.lock().await;
+    let (_dir, core, _path, id) = setup(Config::default()).await;
+    let before = core
+        .list_handles()
+        .await
+        .into_iter()
+        .find(|h| h.id == id)
+        .unwrap();
+    core.query(&id, "CREATE TABLE rolled_back(value INTEGER)", &[])
+        .await
+        .unwrap();
+    core.rollback(&id).await.unwrap();
+    let after = core
+        .list_handles()
+        .await
+        .into_iter()
+        .find(|h| h.id == id)
+        .unwrap();
+    assert!(after.schema_observed);
+    assert_eq!(after.schema_version, before.schema_version);
+    assert_eq!(after.observation_generation, before.observation_generation);
+    assert!(core.begin_transaction(&id, "deferred").await.is_ok());
+    let absent = core
+        .query(
+            &id,
+            "SELECT name FROM sqlite_schema WHERE name = 'rolled_back'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(absent.rows.is_empty());
+    core.rollback(&id).await.unwrap();
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_or_denied_mutations_retain_observation() {
+    let _hooks = HOOK_LOCK.lock().await;
+    let (_dir, core, id) = table_setup().await;
+    let before = core
+        .list_handles()
+        .await
+        .into_iter()
+        .find(|h| h.id == id)
+        .unwrap();
     assert!(
         core.query(&id, "CREATE TABLE t(x TEXT)", &[])
             .await
             .is_err()
     );
-    let h = core
-        .list_handles()
-        .await
-        .into_iter()
-        .find(|h| h.id == id)
-        .unwrap();
-    assert!(
-        !h.schema_observed,
-        "failed DDL must invalidate before the next call"
-    );
-    assert!(matches!(
-        core.query(&id, "SELECT 1", &[]).await,
-        Err(CoreError::SchemaRequired | CoreError::SchemaStale)
-    ));
-    core.shutdown().await;
-}
-
-#[tokio::test]
-async fn denied_stored_ddl_invalidates() {
-    let _hooks = HOOK_LOCK.lock().await;
-    let (_d, core, id) = table_setup().await;
     assert!(
         core.query(
             &id,
             "CREATE VIEW v AS SELECT * FROM pragma_table_info('t')",
-            &[]
+            &[],
         )
         .await
         .is_err()
     );
     assert!(
-        !core
-            .list_handles()
+        core.query(&id, "UPDATE t SET x = 'ok' WHERE 0", &[])
             .await
-            .into_iter()
-            .find(|h| h.id == id)
-            .unwrap()
-            .schema_observed
+            .is_ok()
     );
-    core.shutdown().await;
-}
-
-#[tokio::test]
-async fn queued_mutation_markers_isolated() {
-    let _hooks = HOOK_LOCK.lock().await;
-    let (_d, core, id) = table_setup().await;
-    let first = core.query(&id, "CREATE TABLE q(x)", &[]).await;
-    assert!(first.is_ok());
-    let second = core.query(&id, "SELECT 1", &[]).await;
-    assert!(second.is_err());
-    let h = core
+    let after = core
         .list_handles()
         .await
         .into_iter()
         .find(|h| h.id == id)
         .unwrap();
-    assert!(!h.schema_observed);
+    assert!(after.schema_observed);
+    assert_eq!(after.observation_generation, before.observation_generation);
+    core.rollback(&id).await.unwrap();
     core.shutdown().await;
 }
 
 #[tokio::test]
 async fn dropped_caller_publishes_mutation_state() {
     let _hooks = HOOK_LOCK.lock().await;
-    let (_d, core, id) = table_setup().await;
-    // Freeze the worker right after the CREATE TABLE closure completed
-    // (statement executed, attempted-DDL marker set), then drop the caller
-    // future before core-side drain/invalidation runs. The admitted operation
-    // must still publish its invalidation exactly once.
+    let (_dir, core, id) = table_setup().await;
     sqlite_mcp_core::test_support::arm(sqlite_mcp_core::test_support::Event::BeginCompletion);
     let task = tokio::spawn({
         let c = core.clone();
@@ -135,77 +319,138 @@ async fn dropped_caller_publishes_mutation_state() {
     sqlite_mcp_core::test_support::release_arm(
         sqlite_mcp_core::test_support::Event::BeginCompletion,
     );
-    // Any gate-ordered operation runs strictly after the coordinator's
-    // publication: the stale observation must refuse the follow-up query.
-    assert!(matches!(
-        core.query(&id, "SELECT 1", &[]).await,
-        Err(CoreError::SchemaRequired | CoreError::SchemaStale)
-    ));
-    let h = core
+    assert!(core.query(&id, "SELECT 1", &[]).await.is_ok());
+    let handle = core
         .list_handles()
         .await
         .into_iter()
         .find(|h| h.id == id)
         .unwrap();
-    assert!(
-        !h.schema_observed,
-        "dropped caller skipped attempted-DDL invalidation"
-    );
-    // The DDL itself executed inside the worker despite the dropped caller.
-    core.get_schema(&id).await.unwrap();
-    assert!(
-        core.query(
-            &id,
-            "SELECT count(*) FROM sqlite_schema WHERE name = 'dropped'",
-            &[]
-        )
+    assert!(handle.schema_observed);
+    core.rollback(&id).await.unwrap();
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn schema_cookie_external_ddl_interleaving() {
+    enable_hooks();
+    let _hooks = HOOK_LOCK.lock().await;
+    let (dir, core, id) = table_setup().await;
+    core.rollback(&id).await.unwrap();
+    let path = dir.path().join("db.sqlite");
+    let external = rusqlite::Connection::open(path).unwrap();
+    external
+        .execute_batch("CREATE TABLE external_cookie(x INTEGER)")
+        .unwrap();
+    let result = core.begin_transaction(&id, "deferred").await;
+    assert!(matches!(
+        result,
+        Err(sqlite_mcp_core::CoreError::SchemaStale)
+    ));
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn commit_fault_open_continuable_preserves_transaction() {
+    let _hooks = HOOK_LOCK.lock().await;
+    let (_dir, core, _path, id) = setup(Config::default()).await;
+    core.query(&id, "CREATE TABLE pending_commit(x)", &[])
         .await
-        .is_ok()
+        .unwrap();
+    sqlite_mcp_core::test_support::inject_commit_fault(
+        sqlite_mcp_core::test_support::CommitFault::OpenContinuable,
+    );
+    let error = core.commit(&id).await.unwrap_err();
+    assert!(error.to_string().contains("commit lifecycle"));
+    let handle = core
+        .list_handles()
+        .await
+        .into_iter()
+        .find(|h| h.id == id)
+        .unwrap();
+    assert!(handle.transaction_id.is_some());
+    assert!(handle.schema_observed);
+    core.rollback(&id).await.unwrap();
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn commit_fault_autocommit_restored_discards_pending_state() {
+    let _hooks = HOOK_LOCK.lock().await;
+    let (_dir, core, _path, id) = setup(Config::default()).await;
+    core.query(&id, "CREATE TABLE discarded_commit(x)", &[])
+        .await
+        .unwrap();
+    sqlite_mcp_core::test_support::inject_commit_fault(
+        sqlite_mcp_core::test_support::CommitFault::AutocommitRestoredUnconfirmed,
+    );
+    let error = core.commit(&id).await.unwrap_err();
+    assert!(error.to_string().contains("commit lifecycle"));
+    let handle = core
+        .list_handles()
+        .await
+        .into_iter()
+        .find(|h| h.id == id)
+        .unwrap();
+    assert!(handle.transaction_id.is_none());
+    assert!(handle.schema_observed);
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn post_commit_fault_publishes_schema_invalidation() {
+    let _hooks = HOOK_LOCK.lock().await;
+    let (_dir, core, _path, id) = setup(Config::default()).await;
+    core.query(&id, "CREATE TABLE durable_commit(x)", &[])
+        .await
+        .unwrap();
+    let before = core
+        .list_handles()
+        .await
+        .into_iter()
+        .find(|h| h.id == id)
+        .unwrap();
+    sqlite_mcp_core::test_support::inject_commit_fault(
+        sqlite_mcp_core::test_support::CommitFault::AutocommitRestored,
+    );
+    let error = core.commit(&id).await.unwrap_err();
+    assert!(error.to_string().contains("commit lifecycle"));
+    let handle = core
+        .list_handles()
+        .await
+        .into_iter()
+        .find(|h| h.id == id)
+        .unwrap();
+    assert!(handle.transaction_id.is_none());
+    assert!(!handle.schema_observed);
+    assert_eq!(
+        handle.observation_generation,
+        before.observation_generation + 1
+    );
+    assert!(
+        core.get_schema(&id)
+            .await
+            .unwrap()
+            .objects
+            .iter()
+            .any(|o| o.name == "durable_commit")
     );
     core.shutdown().await;
 }
 
 #[tokio::test]
-async fn dropped_observe_publishes_observation() {
+async fn commit_fault_uncertain_invalidates_handle() {
     let _hooks = HOOK_LOCK.lock().await;
-    enable_hooks();
-    let (dir, core, _path, _id) = setup(Config::default()).await;
-    // A second handle that has never been observed.
-    let (second, _) = core
-        .create_database(dir.path().join("second.sqlite").to_str().unwrap())
+    let (_dir, core, _path, id) = setup(Config::default()).await;
+    core.query(&id, "CREATE TABLE uncertain_commit(x)", &[])
         .await
         .unwrap();
-    let handle = core.open_database(&second, false).await.unwrap();
-    assert!(!handle.schema_observed);
-    let h2 = handle.id.clone();
-    // Freeze the managed read right after the schema version was read, then
-    // drop the caller before publication. The completed observation must
-    // still be published exactly once: begin relies on that freshness.
-    sqlite_mcp_core::test_support::arm(sqlite_mcp_core::test_support::Event::SchemaVersionRead);
-    let task = tokio::spawn({
-        let c = core.clone();
-        async move { c.get_schema(&h2).await }
-    });
-    let arrived = tokio::task::spawn_blocking(move || {
-        sqlite_mcp_core::test_support::wait_for(
-            sqlite_mcp_core::test_support::Event::SchemaVersionRead,
-            std::time::Duration::from_secs(5),
-        )
-    });
-    tokio::time::timeout(std::time::Duration::from_secs(8), arrived)
-        .await
-        .expect("arrival wait join timed out")
-        .expect("arrival wait task panicked")
-        .expect("observation never reached the frozen event");
-    task.abort();
-    let _ = task.await;
-    sqlite_mcp_core::test_support::release_arm(
-        sqlite_mcp_core::test_support::Event::SchemaVersionRead,
+    sqlite_mcp_core::test_support::inject_commit_fault(
+        sqlite_mcp_core::test_support::CommitFault::Uncertain,
     );
-    assert!(
-        core.begin_transaction(&handle.id, "deferred").await.is_ok(),
-        "dropped observation was not published; begin wrongly refused"
-    );
+    let error = core.commit(&id).await.unwrap_err();
+    assert!(error.to_string().contains("commit lifecycle"));
+    assert!(core.list_handles().await.into_iter().all(|h| h.id != id));
     core.shutdown().await;
 }
 
@@ -226,124 +471,24 @@ async fn predispatch_rejection_keeps_observation() {
         .into_iter()
         .find(|h| h.id == id)
         .unwrap();
-    assert_eq!(after.observation_generation, before.observation_generation);
     assert!(after.schema_observed);
-    core.shutdown().await;
-}
-
-#[tokio::test]
-async fn schema_snapshot_external_ddl_interleaving() {
-    enable_hooks();
-    let _hooks = HOOK_LOCK.lock().await;
-    let (dir, core, id) = table_setup().await;
-    let path = dir.path().join("db.sqlite");
+    assert_eq!(after.observation_generation, before.observation_generation);
     core.rollback(&id).await.unwrap();
-    let before = core.get_schema(&id).await.unwrap();
-    let barrier =
-        sqlite_mcp_core::test_support::arm(sqlite_mcp_core::test_support::Event::SchemaVersionRead);
-    let task = tokio::spawn({
-        let c = core.clone();
-        let i = id.clone();
-        async move { c.get_schema(&i).await }
-    });
-    // The armed emission parks the runtime thread inside the managed read, so
-    // the observe-then-release sequence must run in a blocking task.
-    let wait_event = sqlite_mcp_core::test_support::Event::SchemaVersionRead;
-    tokio::task::spawn_blocking(move || {
-        sqlite_mcp_core::test_support::wait_for(wait_event, std::time::Duration::from_secs(2))
-            .expect("schema version read observed");
-        barrier.release();
-    })
-    .await
-    .expect("waiter task");
-    let external = rusqlite::Connection::open(&path).unwrap();
-    external
-        .execute_batch("CREATE TABLE external_after_read(x INTEGER)")
-        .unwrap();
-    let observed = task.await.unwrap().unwrap();
-    assert_eq!(observed.schema_version, before.schema_version);
-    assert!(
-        observed
-            .objects
-            .iter()
-            .all(|o| o.name != "external_after_read"),
-        "managed read must retain one pre-DDL snapshot"
-    );
-    let h = core
-        .list_handles()
-        .await
-        .into_iter()
-        .find(|h| h.id == id)
-        .unwrap();
-    assert!(h.schema_observed);
-    assert!(
-        core.begin_transaction(&id, "deferred").await.is_err(),
-        "post-DDL begin requires re-observation"
-    );
     core.shutdown().await;
-    drop(dir);
-}
-
-#[tokio::test]
-async fn readonly_schema_snapshot_interleaving() {
-    enable_hooks();
-    let _hooks = HOOK_LOCK.lock().await;
-    let (dir, path) = {
-        let d = tempdir().unwrap();
-        let p = d.path().join("ro.sqlite");
-        let c = rusqlite::Connection::open(&p).unwrap();
-        c.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(x)")
-            .unwrap();
-        (d, p.to_string_lossy().into_owned())
-    };
-    let core = Core::new(Config::default()).unwrap();
-    let h = core.open_database(&path, true).await.unwrap();
-    let before = core.get_schema(&h.id).await.unwrap();
-    let barrier =
-        sqlite_mcp_core::test_support::arm(sqlite_mcp_core::test_support::Event::SchemaVersionRead);
-    let task = tokio::spawn({
-        let c = core.clone();
-        let i = h.id.clone();
-        async move { c.get_schema(&i).await }
-    });
-    let wait_event = sqlite_mcp_core::test_support::Event::SchemaVersionRead;
-    tokio::task::spawn_blocking(move || {
-        sqlite_mcp_core::test_support::wait_for(wait_event, std::time::Duration::from_secs(2))
-            .expect("schema version read observed");
-        // Release inside the blocking task: the armed emission parks the
-        // runtime thread inside the managed read.
-        barrier.release();
-    })
-    .await
-    .expect("waiter task");
-    rusqlite::Connection::open(&path)
-        .unwrap()
-        .execute_batch("CREATE TABLE external_after_read(x INTEGER)")
-        .unwrap();
-    let observed = task.await.unwrap().unwrap();
-    assert_eq!(observed.schema_version, before.schema_version);
-    assert!(
-        observed
-            .objects
-            .iter()
-            .all(|o| o.name != "external_after_read")
-    );
-    assert!(core.begin_transaction(&h.id, "deferred").await.is_err());
-    core.shutdown().await;
-    drop(dir);
 }
 
 #[tokio::test]
 async fn schema_read_preserves_caller_transaction() {
     let _hooks = HOOK_LOCK.lock().await;
-    let (_d, core, id) = table_setup().await;
+    let (_dir, core, id) = table_setup().await;
     let before = core
         .list_handles()
         .await
         .into_iter()
         .find(|h| h.id == id)
         .unwrap();
-    core.get_schema(&id).await.unwrap();
+    let schema = core.get_schema(&id).await.unwrap();
+    assert!(schema.objects.iter().any(|object| object.name == "t"));
     let after = core
         .list_handles()
         .await
@@ -351,60 +496,10 @@ async fn schema_read_preserves_caller_transaction() {
         .find(|h| h.id == id)
         .unwrap();
     assert_eq!(before.transaction_id, after.transaction_id);
+    assert_eq!(before.schema_observed, after.schema_observed);
+    assert_eq!(before.schema_version, after.schema_version);
+    assert_eq!(before.observation_generation, after.observation_generation);
     core.rollback(&id).await.unwrap();
-    core.shutdown().await;
-}
-
-#[tokio::test]
-async fn schema_failure_cleanup_and_gate() {
-    // A cleanup failure on a SUCCESSFUL managed read is uncertain: the
-    // observation must not publish freshness and the handle is invalidated.
-    let _hooks = HOOK_LOCK.lock().await;
-    let (_dir, core, id) = table_setup().await;
-    // Close the caller transaction so the observation runs on the managed
-    // path (caller transactions retain ownership and never consume cleanup).
-    core.rollback(&id).await.unwrap();
-    let before = core
-        .list_handles()
-        .await
-        .into_iter()
-        .find(|h| h.id == id)
-        .unwrap();
-    sqlite_mcp_core::test_support::inject_cleanup_fault(
-        sqlite_mcp_core::CleanupStage::ManagedSchemaCleanup,
-        "schema cleanup",
-    );
-    let result = core.get_schema(&id).await;
-    assert!(result.is_err(), "cleanup failure must surface");
-    let after = core.list_handles().await.into_iter().find(|h| h.id == id);
-    // Uncertain cleanup invalidates: the handle cannot be used again.
-    assert!(
-        after.is_none() || !after.unwrap().schema_observed,
-        "failed managed observation must not publish freshness"
-    );
-    let _ = before;
-    core.shutdown().await;
-}
-
-#[tokio::test]
-async fn schema_cleanup_failure_invalidates() {
-    let _hooks = HOOK_LOCK.lock().await;
-    let (dir, core, id) = table_setup().await;
-    core.rollback(&id).await.unwrap();
-    let path = dir.path().join("db.sqlite");
-    rusqlite::Connection::open(&path)
-        .unwrap()
-        .execute_batch("PRAGMA writable_schema=ON; UPDATE sqlite_schema SET sql='malformed' WHERE name='t'; PRAGMA writable_schema=OFF;")
-        .unwrap();
-    sqlite_mcp_core::test_support::inject_cleanup_fault(
-        sqlite_mcp_core::CleanupStage::ManagedSchemaCleanup,
-        "schema cleanup",
-    );
-    let _ = core.get_schema(&id).await;
-    assert!(
-        core.list_handles().await.into_iter().all(|h| h.id != id),
-        "uncertain managed cleanup invalidates handle"
-    );
     core.shutdown().await;
 }
 
@@ -417,10 +512,8 @@ async fn bare_digits_are_parser_errors() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(
-        !e.contains("SQL exceeds configured byte limit"),
-        "parser error was misclassified: {e}"
-    );
+    assert!(!e.contains("SQL exceeds configured byte limit"));
+    core.rollback(&id).await.unwrap();
     core.shutdown().await;
 }
 
@@ -434,6 +527,7 @@ async fn sql_utf8_byte_boundaries() {
     .await;
     assert!(core.query(&id, "SELECT 'é'", &[]).await.is_ok());
     assert!(core.query(&id, "SELECT 'éééééé'", &[]).await.is_err());
+    core.rollback(&id).await.unwrap();
     core.shutdown().await;
 }
 
@@ -443,5 +537,6 @@ async fn numeric_select_values_execute() {
     let (_d, core, id) = table_setup().await;
     let r = core.query(&id, "SELECT 123456789", &[]).await.unwrap();
     assert_eq!(r.rows[0][0], Cell::Integer("123456789".into()));
+    core.rollback(&id).await.unwrap();
     core.shutdown().await;
 }

@@ -3,3 +3,4 @@ target/
 .env.*
 !.env.example
 config.local.toml
+/project.sqlite3

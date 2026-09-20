@@ -98,12 +98,17 @@ pub fn assert_envelope(response: &CallToolResult, error: bool) -> &Value {
     assert!(value.get("result").is_some() ^ value.get("error").is_some());
     let moves = value.get("next_moves").and_then(Value::as_array).unwrap();
     for item in moves {
-        assert!(NAMES.contains(&item.as_str().unwrap()));
+        let text = item.as_str().unwrap();
+        assert!(!text.is_empty());
+        assert!(
+            !text.chars().any(char::is_control),
+            "next_moves entries must be one-line guidance"
+        );
     }
     value
 }
 
-pub const NAMES: [&str; 9] = [
+pub const NAMES: [&str; 11] = [
     "create_database",
     "open_database",
     "list_handles",
@@ -113,4 +118,6 @@ pub const NAMES: [&str; 9] = [
     "commit",
     "rollback",
     "close_database",
+    "extract_sqlite_merge",
+    "import_sqlite_text",
 ];

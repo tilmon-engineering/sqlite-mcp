@@ -12,8 +12,6 @@ async fn setup() -> (tempfile::TempDir, Core, String, String) {
     core.get_schema(&h.id).await.unwrap();
     core.begin_transaction(&h.id, "deferred").await.unwrap();
     core.query(&h.id, "CREATE TABLE t(a)", &[]).await.unwrap();
-    // Re-observe after local DDL before further statements.
-    core.get_schema(&h.id).await.unwrap();
     (dir, core, path, h.id)
 }
 
@@ -45,9 +43,8 @@ async fn sql_policy_escape_matrix() {
             "policy accepted {sql}"
         );
     }
-    // Attempted (denied) agent DDL conservatively invalidates the
-    // observation even when the statement never executes; re-observe.
-    core.get_schema(&id).await.unwrap();
+    // Denied DDL does not change the schema cookie or the committed
+    // observation, so the transaction remains usable.
     let ok = core.query(&id, "EXPLAIN QUERY PLAN SELECT 1", &[]).await;
     assert!(ok.is_ok());
     assert!(
@@ -88,8 +85,6 @@ async fn parameter_validation_and_schema_recheck() {
     core.query(&id, "CREATE VIEW ok AS SELECT 1", &[])
         .await
         .unwrap();
-    // Re-observe after local DDL before further statements.
-    core.get_schema(&id).await.unwrap();
     assert!(core.query(&id, "SELECT * FROM ok", &[]).await.is_ok());
     core.rollback(&id).await.unwrap();
     core.shutdown().await;

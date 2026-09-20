@@ -117,9 +117,6 @@ async fn busy_commit_retains_transaction() {
     let (core, id) = open(path.to_str().unwrap(), Config::default()).await;
     core.begin_transaction(&id, "deferred").await.unwrap();
     core.query(&id, "UPDATE t SET a=2", &[]).await.unwrap();
-    // F-06 contract: the attempted DML invalidated the schema observation;
-    // re-observe before further queries on the handle.
-    core.get_schema(&id).await.unwrap();
     let reader = Connection::open(&path).unwrap();
     reader.execute_batch("BEGIN; SELECT a FROM t;").unwrap();
     let started = Instant::now();
@@ -128,7 +125,11 @@ async fn busy_commit_retains_transaction() {
     assert!(
         matches!(
             err,
-            CoreError::Busy {
+            CoreError::CommitLifecycle {
+                transaction_open: true,
+                transaction_continuable: true,
+                ..
+            } | CoreError::Busy {
                 transaction_open: true,
                 transaction_continuable: true,
                 ..

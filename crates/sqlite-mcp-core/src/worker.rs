@@ -81,6 +81,43 @@ pub enum WorkerError {
         transaction_continuable: bool,
     },
 }
+#[derive(Debug)]
+pub(crate) struct CommitOutcome {
+    pub(crate) result: Result<serde_json::Value, WorkerError>,
+    pub(crate) commit_confirmed: bool,
+    pub(crate) transaction_open: bool,
+    pub(crate) transaction_continuable: bool,
+    pub(crate) expired: bool,
+    pub(crate) uncertain_or_invalidated: bool,
+}
+
+impl CommitOutcome {
+    fn success(value: serde_json::Value, schema_version: i64) -> Self {
+        Self {
+            result: Ok(serde_json::json!({"committed": value, "schema_version": schema_version})),
+            commit_confirmed: true,
+            transaction_open: false,
+            transaction_continuable: false,
+            expired: false,
+            uncertain_or_invalidated: false,
+        }
+    }
+    fn failure(
+        result: Result<serde_json::Value, WorkerError>,
+        open: bool,
+        continuable: bool,
+        uncertain: bool,
+    ) -> Self {
+        Self {
+            result,
+            commit_confirmed: false,
+            transaction_open: open,
+            transaction_continuable: open && continuable,
+            expired: false,
+            uncertain_or_invalidated: uncertain,
+        }
+    }
+}
 #[derive(Clone)]
 pub struct RequestContext {
     pub token: CancelToken,
@@ -122,6 +159,7 @@ pub enum Command {
         oneshot::Sender<Result<serde_json::Value, WorkerError>>,
     ),
     Control(Job, oneshot::Sender<Result<serde_json::Value, WorkerError>>),
+    Commit(oneshot::Sender<CommitOutcome>),
     Expire(oneshot::Sender<bool>),
     Shutdown(oneshot::Sender<Result<ShutdownStatus, WorkerShutdownError>>),
 }
@@ -372,10 +410,10 @@ impl Worker {
                                         });
                                     }
                                 }
-                                let _ = r.send(result);
-                                test_support::emit(test_support::Event::RequestHandover);
                                 idle_deadline = test_support::now_ms()
                                     .saturating_add(idle_seconds.saturating_mul(1000));
+                                let _ = r.send(result);
+                                test_support::emit(test_support::Event::RequestHandover);
                             }
                             Command::Control(f, r) => {
                                 test_support::emit(test_support::Event::ControlEntry);
@@ -384,11 +422,18 @@ impl Worker {
                                     continue;
                                 }
                                 if !conn.is_autocommit() && test_support::now_ms() >= idle_deadline {
-                                    let fault = test_support::take_cleanup_fault(crate::operation::CleanupStage::ExpiryRollback);
-                                    let _rollback = policy::trusted(|| conn.execute_batch("ROLLBACK"));
-                                    let _ = fault;
-                                    expired = true;
-                                    let _ = r.send(Err(WorkerError::Message("TRANSACTION_EXPIRED".into())));
+                                    let injected = test_support::take_cleanup_fault(crate::operation::CleanupStage::ExpiryRollback).is_some();
+                                    let rollback = if injected {
+                                        Err(rusqlite::Error::InvalidQuery)
+                                    } else {
+                                        policy::trusted(|| conn.execute_batch("ROLLBACK"))
+                                    };
+                                    if rollback.is_ok() && conn.is_autocommit() {
+                                        expired = true;
+                                        let _ = r.send(Err(WorkerError::Message("TRANSACTION_EXPIRED".into())));
+                                    } else {
+                                        let _ = r.send(Err(WorkerError::Message("handle invalidated; expiry rollback uncertain".into())));
+                                    }
                                     continue;
                                 }
                                 // Control cleanup is deliberately not wired to a request token.
@@ -400,10 +445,78 @@ impl Worker {
                                 idle_deadline = test_support::now_ms()
                                     .saturating_add(idle_seconds.saturating_mul(1000));
                             }
+                            Command::Commit(r) => {
+                                test_support::emit(test_support::Event::CommitEntry);
+                                if !expired && !conn.is_autocommit() && test_support::now_ms() >= idle_deadline {
+                                    let rollback = policy::trusted(|| conn.execute_batch("ROLLBACK"));
+                                    if rollback.is_ok() && conn.is_autocommit() {
+                                        expired = true;
+                                        let _ = r.send(CommitOutcome { result: Err(WorkerError::Message("TRANSACTION_EXPIRED".into())), commit_confirmed: false, transaction_open: false, transaction_continuable: false, expired: true, uncertain_or_invalidated: false });
+                                    } else {
+                                        let _ = r.send(CommitOutcome::failure(Err(WorkerError::Message("handle invalidated; expiry rollback uncertain".into())), !conn.is_autocommit(), false, true));
+                                    }
+                                    continue;
+                                }
+                                if expired {
+                                    let _ = r.send(CommitOutcome { result: Err(WorkerError::Message("TRANSACTION_EXPIRED".into())), commit_confirmed: false, transaction_open: false, transaction_continuable: false, expired: true, uncertain_or_invalidated: false });
+                                    continue;
+                                }
+                                if conn.is_autocommit() {
+                                    let _ = r.send(CommitOutcome::failure(Err(WorkerError::Message("no transaction open".into())), false, false, false));
+                                    continue;
+                                }
+                                let fault = test_support::take_commit_fault();
+                                let commit = match fault {
+                                    Some(test_support::CommitFault::OpenContinuable) => Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY), Some("injected open continuable commit fault".into()))),
+                                    Some(test_support::CommitFault::AutocommitRestoredUnconfirmed) | Some(test_support::CommitFault::Uncertain) => {
+                                        let rollback = policy::trusted(|| conn.execute_batch("ROLLBACK"));
+                                        if rollback.is_ok() && conn.is_autocommit() { Err(rusqlite::Error::InvalidQuery) } else { Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY), Some("injected uncertain commit fault".into()))) }
+                                    }
+                                    Some(test_support::CommitFault::AutocommitRestored) => {
+                                        let result = policy::trusted(|| conn.execute_batch("COMMIT"));
+                                        if result.is_ok() && conn.is_autocommit() { Err(rusqlite::Error::InvalidQuery) } else { result }
+                                    }
+                                    None => policy::trusted(|| conn.execute_batch("COMMIT")),
+                                };
+                                let autocommit = conn.is_autocommit();
+                                test_support::emit(test_support::Event::CommitReturn);
+                                match (fault, commit) {
+                                    (Some(test_support::CommitFault::AutocommitRestored), Err(error)) if autocommit => {
+                                        let _ = r.send(CommitOutcome { result: Err(WorkerError::Sqlite(error)), commit_confirmed: true, transaction_open: false, transaction_continuable: false, expired: false, uncertain_or_invalidated: false });
+                                    }
+                                    (Some(test_support::CommitFault::AutocommitRestoredUnconfirmed), Err(error)) if autocommit => {
+                                        let _ = r.send(CommitOutcome::failure(Err(WorkerError::Sqlite(error)), false, false, false));
+                                    }
+                                    (Some(test_support::CommitFault::Uncertain), Err(error)) => {
+                                        let _ = r.send(CommitOutcome::failure(Err(WorkerError::Sqlite(error)), !autocommit, false, true));
+                                    }
+                                    (Some(test_support::CommitFault::OpenContinuable), Err(error)) => {
+                                        let _ = r.send(CommitOutcome::failure(Err(WorkerError::Sqlite(error)), !autocommit, !autocommit, false));
+                                    }
+                                    (None, Ok(())) if autocommit => {
+                                        match policy::trusted(|| conn.query_row("PRAGMA schema_version", [], |row| row.get(0))) {
+                                            Ok(version) => { let _ = r.send(CommitOutcome::success(serde_json::json!(true), version)); }
+                                            Err(error) => { let _ = r.send(CommitOutcome { result: Err(WorkerError::Sqlite(error)), commit_confirmed: true, transaction_open: false, transaction_continuable: false, expired: false, uncertain_or_invalidated: true }); }
+                                        }
+                                    }
+                                    (_, Ok(())) => { let _ = r.send(CommitOutcome::failure(Err(WorkerError::Message("commit completed without restoring autocommit".into())), true, true, true)); }
+                                    (_, Err(error)) if !autocommit => { let _ = r.send(CommitOutcome::failure(Err(WorkerError::Sqlite(error)), true, true, false)); }
+                                    (_, Err(error)) => { let _ = r.send(CommitOutcome::failure(Err(WorkerError::Sqlite(error)), false, false, true)); }
+                                }
+                            }
                             Command::Expire(r) => {
                                 let expired = !conn.is_autocommit();
                                 if expired {
-                                    let _ = policy::trusted(|| conn.execute_batch("ROLLBACK"));
+                                    let injected = test_support::take_cleanup_fault(crate::operation::CleanupStage::ExpiryRollback).is_some();
+                                    let rollback = if injected {
+                                        Err(rusqlite::Error::InvalidQuery)
+                                    } else {
+                                        policy::trusted(|| conn.execute_batch("ROLLBACK"))
+                                    };
+                                    if rollback.is_err() || !conn.is_autocommit() {
+                                        let _ = r.send(false);
+                                        continue;
+                                    }
                                 }
                                 let _ = r.send(expired);
                             }
@@ -505,6 +618,14 @@ impl Worker {
             .await
             .map_err(|_| WorkerError::Closed)?;
         rrx.await.map_err(|_| WorkerError::Closed)?
+    }
+    pub(crate) async fn run_commit(&self) -> Result<CommitOutcome, WorkerError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::Commit(tx))
+            .await
+            .map_err(|_| WorkerError::Closed)?;
+        rx.await.map_err(|_| WorkerError::Closed)
     }
     pub async fn run_with_token<F>(
         &self,

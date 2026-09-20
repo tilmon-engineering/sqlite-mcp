@@ -15,7 +15,7 @@ mise run build    # cargo build --workspace --locked
 mise run ci       # all of the above
 ```
 
-Do not report a check as passing unless it was actually run. At time of writing, `mise run ci` passes on this machine (format, Clippy `-D warnings`, 124 tests, and locked build); this is not a guarantee for other machines. Keep `Cargo.lock` current and use `--locked` for verification.
+Do not report a check as passing unless it was actually run. Keep `Cargo.lock` current and use `--locked` for verification; report the exact commands and results observed in the current work session.
 
 ## Scope and architecture
 
@@ -29,7 +29,7 @@ Do not report a check as passing unless it was actually run. At time of writing,
 
 `DESIGN.md` is normative. Any change to tool names/arguments, path semantics, transaction transitions, SQL authorization, schema freshness, error classes, envelopes, caps, shutdown, or config fields must update DESIGN.md, README.md, and relevant executable workflow tests in the same change. Keep README examples synchronized with the documented workflow fixture and `config.example.toml` synchronized with the loader test.
 
-The v1 tool set is exactly `create_database`, `open_database`, `list_handles`, `get_schema`, `begin_transaction`, `query`, `commit`, `rollback`, and `close_database`. Preserve required explicit `readonly`, absolute paths, mandatory schema observation before begin/query, explicit commit/rollback, positional typed parameters, one statement per query, and bounded outputs.
+The v1 tool set is exactly `create_database`, `open_database`, `list_handles`, `get_schema`, `begin_transaction`, `query`, `commit`, `rollback`, `close_database`, `extract_sqlite_merge`, and `import_sqlite_text`. Preserve required explicit `readonly`, absolute paths, mandatory schema observation before begin/query, explicit commit/rollback, positional typed parameters, one statement per query, bounded outputs, and the merge tools' explicit Git-independent/no-CLI boundary. Merge workspaces and transient tasks remain server-owned and joined; retained `resolved.sql` is intentionally caller-editable, while existing SQLite inputs and output paths are never overwritten.
 
 ## Safety rules
 
@@ -50,4 +50,4 @@ Release work uses the shared workspace Cargo version for the app and core crate 
 5. Review documentation and tool descriptions for exact executable contracts.
 6. Report observed versions/results and residual platform limits; never claim unrun checks.
 
-Do not add HTTP, database inventories, aliases, backups, import/export, deletion, arbitrary extensions, network-filesystem support, implicit permission prompts, or cross-repository dependencies without an approved scope change.
+Do not add HTTP, database inventories, aliases, backups beyond the approved logical merge workflow, deletion, arbitrary extensions, network-filesystem support, implicit permission prompts, or cross-repository dependencies without an approved scope change. The approved merge tools are the only import/export surface: they remain explicit-path, Git-independent, bounded, no-CLI, and non-overwriting.

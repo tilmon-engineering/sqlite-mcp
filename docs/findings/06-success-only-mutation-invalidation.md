@@ -5,9 +5,9 @@
 
 ## Condition
 
-**Expected:** any attempted transaction-local DDL invalidates the schema observation conservatively **even if preparation, execution, or savepoint rollback fails** (DESIGN.md:53-55, 69).
+This finding is historical. The original contract conservatively invalidated on any attempted DDL and drained mutation markers only on successful outcomes. The active contract now distinguishes authorizer classification from schema freshness: an actual cookie-changing local schema mutation remains usable for subsequent statements in the same transaction, and only an actual schema change committed requires one `get_schema` after commit.
 
-**Observed:** `query_with_ct` clears `w.mutation_seen` before dispatch (`core.rs:524`); the authorizer sets the flag for untrusted mutations at **prepare time** (`policy.rs:51-69`), including the preflight `prepare_exact` (`core.rs:545`); the flag is consumed only after a **successful** outcome (`core.rs:652-658`). Every error return (`core.rs:623-650`) skips the drain.
+**Historical observed behavior:** `query_with_ct` cleared `w.mutation_seen` before dispatch; the authorizer set the flag for untrusted mutations at prepare time, including preflight `prepare_exact`; and the flag was consumed only after a successful outcome, allowing marker leakage across failed requests.
 
 Reproducer (trace-verified): after `CREATE TABLE t(x)` + re-observation, query `CREATE TABLE t(x)` (duplicate) → error returned, handle still `schema_observed=true`; a following `SELECT 1` is **accepted**, and only that later success finally drains the stale flag and invalidates. Variants with the same skip: `CREATE TABLE t(x); SELECT 1` (preflight sets flag, returns Multiple) and — worse — `CREATE VIEW v AS SELECT * FROM pragma_table_info('t')`, denied structurally by `check_stored_body` (`policy.rs:162-171`) **before any authorizer callback**, so no flag is set at all.
 

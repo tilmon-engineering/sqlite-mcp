@@ -1,18 +1,13 @@
 //! Shared operation seam declarations (Phase 0).
 //!
-//! Orchestrator-owned. These types freeze the coordination contract that the
-//! finding owners (L/Q/C/F/P) compile against; behavior wiring lands with each
-//! owner's GREEN change after its RED regression is recorded. Compatibility
-//! adapters that temporarily keep the old behavior are removed when GREEN
-//! implementations land.
+//! Historical typed coordination scaffolding retained for compatibility with
+//! the original design seams. The current implementation uses `Core::coordinate`
+//! plus each handle's mutex gate as its active coordinator; it does not enqueue
+//! [`OperationRecord`] values or consume [`OperationOutcome`] directly.
 //!
-//! Invariants (authoritative, enforced by L's coordinator):
-//! - Every admitted [`OperationRecord`] is processed exactly once and its
-//!   outcome is published exactly once, even if the originating caller was
-//!   dropped.
-//! - FIFO sequence order is the execution authority, not task scheduling.
-//! - Publication of the authoritative outcome precedes execution of the next
-//!   admitted record on the same handle.
+//! The active lifecycle invariant is still the same: operation-specific core
+//! methods publish authoritative worker facts while holding the per-handle gate,
+//! and a dropped caller abandons only its reply, not the admitted future.
 use std::fmt;
 
 use crate::worker::{Job, WorkerError};

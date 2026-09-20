@@ -30,6 +30,10 @@ pub enum CoreError {
     SchemaTooLarge,
     #[error("schema observation is stale")]
     SchemaStale,
+    #[error("server is shutting down")]
+    ServerShutdown,
+    #[error("merge {class}: {message}", class = .0.class, message = .0.message)]
+    Merge(crate::merge::MergeError),
     #[error("transaction expired")]
     TransactionExpired,
     #[error(
@@ -66,6 +70,15 @@ pub enum CoreError {
     DeadlineExceeded {
         transaction_open: bool,
         transaction_continuable: bool,
+    },
+    #[error("commit lifecycle failure: {error}")]
+    CommitLifecycle {
+        error: Box<WorkerError>,
+        commit_confirmed: bool,
+        transaction_open: bool,
+        transaction_continuable: bool,
+        expired: bool,
+        uncertain_or_invalidated: bool,
     },
 }
 

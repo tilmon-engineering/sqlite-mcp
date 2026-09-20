@@ -1,6 +1,8 @@
+use crate::handles::TransactionSchemaState;
 use crate::test_support;
 use crate::worker::RequestHandle;
 use crate::{
+    admission::{AdmissionRegistry, ReservationKind, SharedAdmission},
     config::Config,
     handles::Handle,
     operation::ShutdownReport,
@@ -25,9 +27,12 @@ pub struct Core {
     /// Shared idempotent completion for global shutdown; repeated and
     /// concurrent callers resolve the identical report.
     shutdown_report: Arc<tokio::sync::OnceCell<ShutdownReport>>,
+    admission: SharedAdmission,
+    admission_notify: Arc<tokio::sync::Notify>,
 }
 struct State {
     handles: HashMap<String, (Handle, Worker)>,
+    transaction_schema: HashMap<String, TransactionSchemaState>,
     /// (device, inode) of every open database file for duplicate-identity
     /// detection across symlinks and hardlinks.
     identities: HashMap<(u64, u64), String>,
@@ -69,11 +74,14 @@ impl Core {
         Ok(Self {
             inner: Arc::new(Mutex::new(State {
                 handles: HashMap::new(),
+                transaction_schema: HashMap::new(),
                 identities: HashMap::new(),
                 gates: HashMap::new(),
             })),
             config,
             shutdown_report: Arc::new(tokio::sync::OnceCell::new()),
+            admission: Arc::new(Mutex::new(AdmissionRegistry::default())),
+            admission_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -89,12 +97,11 @@ impl Core {
         Ok((g.clone(), w.clone()))
     }
 
-    /// Admit one operation to a core-owned coordinator: the coordinator task
-    /// owns execution and authoritative publication, so a dropped caller
-    /// abandons only its reply — never the publication. Worker-side effects
-    /// (mutation-marker drains, transaction publication/clearing, observation
-    /// freshness, expiry tombstones) are applied exactly once per admitted
-    /// operation even when the reply receiver vanishes.
+    /// Admit one operation to the core-owned coordinator wrapper. The wrapper
+    /// keeps the admitted future alive after the caller drops its reply; each
+    /// operation still serializes through the per-handle gate, and the
+    /// operation-specific method performs authoritative publication before
+    /// returning its result.
     fn coordinate<T, F>(&self, operation: F) -> impl Future<Output = Result<T, CoreError>> + Send
     where
         T: Send + 'static,
@@ -237,6 +244,7 @@ impl Core {
             }
             s.handles.remove(id);
             s.gates.remove(id);
+            s.transaction_schema.remove(id);
             w
         };
         let shutdown = w.shutdown().await;
@@ -255,9 +263,18 @@ impl Core {
         self.shutdown_report
             .get_or_init(|| async {
                 let mut report = ShutdownReport::new();
+                let _transient = self.admission.lock().await.begin_shutdown();
+                loop {
+                    if self.admission.lock().await.active_len() == 0 {
+                        break;
+                    }
+                    self.admission_notify.notified().await;
+                }
+                self.admission.lock().await.complete_shutdown();
                 let workers = {
                     let mut s = self.inner.lock().await;
                     let drained = s.handles.drain().collect::<Vec<_>>();
+                    s.transaction_schema.clear();
                     s.gates.clear();
                     drained
                         .into_iter()
@@ -283,15 +300,30 @@ impl Core {
             .clone()
     }
     pub async fn expire_handle(&self, id: &str) -> Result<bool, CoreError> {
+        let this = self.clone();
+        let owned_id = id.to_owned();
+        self.coordinate(async move { this.expire_admitted(&owned_id).await })
+            .await
+    }
+
+    async fn expire_admitted(&self, id: &str) -> Result<bool, CoreError> {
         let (gate, w) = self.handle_gate(id).await?;
         let _operation = gate.lock().await;
-        let expired = w.expire().await?;
+        let expired = w.expire().await.map_err(CoreError::Worker)?;
         if expired {
             let mut s = self.inner.lock().await;
-            if let Some((h, _)) = s.handles.get_mut(id) {
-                h.expired = true;
-                h.transaction_id = None;
-                h.transaction_mode = None;
+            if s.handles.contains_key(id) {
+                let tx = s.transaction_schema.remove(id);
+                if let Some((h, _)) = s.handles.get_mut(id) {
+                    if let Some(tx) = tx {
+                        h.schema_observed = tx.pre_observed;
+                        h.schema_version = tx.pre_version;
+                        h.observation_generation = tx.pre_generation;
+                    }
+                    h.expired = true;
+                    h.transaction_id = None;
+                    h.transaction_mode = None;
+                }
             }
         }
         Ok(expired)
@@ -304,6 +336,146 @@ impl Core {
             .values()
             .map(|(h, _)| h.clone())
             .collect()
+    }
+
+    async fn admit_merge(
+        &self,
+        ct: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<Arc<crate::admission::Reservation>, CoreError> {
+        let reservation = self
+            .admission
+            .lock()
+            .await
+            .admit(ReservationKind::TransientMerge)
+            .map_err(|_| CoreError::ServerShutdown)?;
+        if ct.is_some_and(|token| token.is_cancelled()) {
+            self.admission.lock().await.finish(reservation.id);
+            self.admission_notify.notify_one();
+            return Err(CoreError::Cancelled {
+                transaction_open: false,
+                transaction_continuable: false,
+            });
+        }
+        Ok(reservation)
+    }
+
+    async fn finish_merge(&self, reservation: &crate::admission::Reservation) {
+        self.admission.lock().await.finish(reservation.id);
+        self.admission_notify.notify_one();
+    }
+
+    pub async fn extract_sqlite_merge(
+        &self,
+        base_path: &str,
+        ours_path: &str,
+        theirs_path: &str,
+    ) -> Result<crate::ExtractionResult, CoreError> {
+        self.extract_sqlite_merge_with_ct(base_path, ours_path, theirs_path, None)
+            .await
+    }
+
+    pub async fn extract_sqlite_merge_with_ct(
+        &self,
+        base_path: &str,
+        ours_path: &str,
+        theirs_path: &str,
+        ct: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<crate::ExtractionResult, CoreError> {
+        let reservation = self.admit_merge(ct.as_ref()).await?;
+        let this = self.clone();
+        let base = base_path.to_owned();
+        let ours = ours_path.to_owned();
+        let theirs = theirs_path.to_owned();
+        self.coordinate(async move {
+            if ct
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                this.finish_merge(&reservation).await;
+                return Err(CoreError::Cancelled {
+                    transaction_open: false,
+                    transaction_continuable: false,
+                });
+            }
+            let config = this.config.clone();
+            let operation_cancel = reservation.cancel.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                crate::merge::extract(
+                    &base,
+                    &ours,
+                    &theirs,
+                    config.merge_text_byte_limit,
+                    config.merge_statement_limit,
+                    config.merge_source_observation_byte_limit,
+                    Some(operation_cancel),
+                )
+            });
+            let result = match task.await {
+                Ok(Ok(result)) => Ok(result),
+                Ok(Err(error)) => Err(CoreError::Merge(error)),
+                Err(error) => Err(CoreError::Worker(WorkerError::Message(format!(
+                    "merge worker join failed: {error}"
+                )))),
+            };
+            this.finish_merge(&reservation).await;
+            result
+        })
+        .await
+    }
+
+    pub async fn import_sqlite_text(
+        &self,
+        sql_path: &str,
+        output_path: &str,
+    ) -> Result<crate::ImportResult, CoreError> {
+        self.import_sqlite_text_with_ct(sql_path, output_path, None)
+            .await
+    }
+
+    pub async fn import_sqlite_text_with_ct(
+        &self,
+        sql_path: &str,
+        output_path: &str,
+        ct: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<crate::ImportResult, CoreError> {
+        let reservation = self.admit_merge(ct.as_ref()).await?;
+        let this = self.clone();
+        let sql = sql_path.to_owned();
+        let output = output_path.to_owned();
+        self.coordinate(async move {
+            if ct
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                this.finish_merge(&reservation).await;
+                return Err(CoreError::Cancelled {
+                    transaction_open: false,
+                    transaction_continuable: false,
+                });
+            }
+            let config = this.config.clone();
+            let operation_cancel = reservation.cancel.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                crate::merge::import(
+                    &sql,
+                    &output,
+                    config.merge_text_byte_limit,
+                    config.merge_statement_limit,
+                    config.merge_image_byte_limit,
+                    Some(operation_cancel),
+                )
+            });
+            let result = match task.await {
+                Ok(Ok(result)) => Ok(result),
+                Ok(Err(error)) => Err(CoreError::Merge(error)),
+                Err(error) => Err(CoreError::Worker(WorkerError::Message(format!(
+                    "merge worker join failed: {error}"
+                )))),
+            };
+            this.finish_merge(&reservation).await;
+            result
+        })
+        .await
     }
 }
 
@@ -329,6 +501,27 @@ impl Core {
             .map(|(_, w)| w.clone())
             .ok_or(CoreError::UnknownHandle)
     }
+
+    async fn invalidate_handle(&self, id: &str) {
+        let worker = {
+            let mut s = self.inner.lock().await;
+            if let Some(identity_key) = s
+                .identities
+                .iter()
+                .find(|(_, value)| value.as_str() == id)
+                .map(|(key, _)| *key)
+            {
+                s.identities.remove(&identity_key);
+            }
+            s.gates.remove(id);
+            s.transaction_schema.remove(id);
+            s.handles.remove(id).map(|(_, worker)| worker)
+        };
+        if let Some(worker) = worker {
+            let _ = worker.shutdown().await;
+        }
+    }
+
     async fn transaction_open(&self, id: &str) -> Result<bool, CoreError> {
         self.inner
             .lock()
@@ -397,34 +590,64 @@ impl Core {
         } else {
             "BEGIN DEFERRED"
         };
-        w.run_with_optional_token(
-            std::time::Duration::from_millis(self.config.query_timeout_ms),
-            ct,
-            move |c, _ctx| {
-                crate::policy::trusted(|| c.execute_batch(sql))?;
-                let current: i64 = crate::policy::trusted(|| {
-                    c.query_row("PRAGMA schema_version", [], |r| r.get(0))
-                })?;
-                if current != expected_version {
-                    let _ = crate::policy::trusted(|| c.execute_batch("ROLLBACK"));
-                    return Err(WorkerError::Message("SCHEMA_STALE".into()));
+        let begin_result = w
+            .run_with_optional_token(
+                std::time::Duration::from_millis(self.config.query_timeout_ms),
+                ct,
+                move |c, _ctx| {
+                    crate::policy::trusted(|| c.execute_batch(sql))?;
+                    let current: i64 = crate::policy::trusted(|| {
+                        c.query_row("PRAGMA schema_version", [], |r| r.get(0))
+                    })?;
+                    if current != expected_version {
+                        let rollback = crate::policy::trusted(|| c.execute_batch("ROLLBACK"));
+                        if rollback.is_err() || !c.is_autocommit() {
+                            return Err(WorkerError::Message(
+                                "begin cleanup failed; handle invalidated".into(),
+                            ));
+                        }
+                        return Err(WorkerError::Message("SCHEMA_STALE".into()));
+                    }
+                    Ok(serde_json::json!(current))
+                },
+            )
+            .await;
+        let live_version = match begin_result {
+            Ok(value) => serde_json::from_value::<i64>(value)
+                .map_err(|e| CoreError::Worker(WorkerError::Message(e.to_string())))?,
+            Err(e) => {
+                if e.to_string().contains("SCHEMA_STALE") {
+                    return Err(CoreError::SchemaStale);
                 }
-                Ok(serde_json::json!(true))
-            },
-        )
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("SCHEMA_STALE") {
-                CoreError::SchemaStale
-            } else {
-                classify_worker_error(e, false)
+                if e.to_string().contains("handle invalidated") {
+                    self.invalidate_handle(id).await;
+                }
+                return Err(classify_worker_error(e, false));
             }
-        })?;
+        };
         let mut s = self.inner.lock().await;
+        let (pre_observed, pre_version, pre_generation) = {
+            let Some((h, _)) = s.handles.get(id) else {
+                return Err(CoreError::UnknownHandle);
+            };
+            (
+                h.schema_observed,
+                h.schema_version,
+                h.observation_generation,
+            )
+        };
+        s.transaction_schema.insert(
+            id.to_owned(),
+            TransactionSchemaState {
+                pre_observed,
+                pre_version,
+                pre_generation,
+                expected_version: live_version,
+                pending_schema_change: false,
+                overlay: None,
+            },
+        );
         let Some((h, _)) = s.handles.get_mut(id) else {
-            // The registry entry vanished (global shutdown or invalidation
-            // raced this publication): there is nothing left to publish onto.
-            // Report unknown rather than panicking.
             return Err(CoreError::UnknownHandle);
         };
         h.transaction_id = Some(uuid::Uuid::new_v4().to_string());
@@ -440,34 +663,62 @@ impl Core {
     async fn rollback_admitted(&self, id: &str) -> Result<Handle, CoreError> {
         let (gate, w) = self.handle_gate(id).await?;
         let _operation = gate.lock().await;
-        w.run_control(|c, _ctx| {
-            test_support::emit(test_support::Event::RollbackCompletion);
-            if !c.is_autocommit() {
-                crate::policy::trusted(|| c.execute_batch("ROLLBACK"))?
-            };
-            Ok(serde_json::json!(true))
-        })
-        .await
-        .map_err(|e| {
+        let rollback_result = w
+            .run_control(|c, _ctx| {
+                test_support::emit(test_support::Event::RollbackCompletion);
+                if !c.is_autocommit() {
+                    if test_support::take_cleanup_fault(
+                        crate::operation::CleanupStage::ConnectionRollback,
+                    )
+                    .is_some()
+                    {
+                        return Err(WorkerError::Message(
+                            "rollback cleanup failed; handle invalidated".into(),
+                        ));
+                    }
+                    crate::policy::trusted(|| c.execute_batch("ROLLBACK"))?
+                };
+                if !c.is_autocommit() {
+                    return Err(WorkerError::Message(
+                        "rollback cleanup failed; handle invalidated".into(),
+                    ));
+                }
+                Ok(serde_json::json!(true))
+            })
+            .await;
+        if let Err(e) = rollback_result {
             let message = e.to_string();
             if message.contains("TRANSACTION_EXPIRED")
                 && let Ok(mut s) = self.inner.try_lock()
-                && let Some((h, _)) = s.handles.get_mut(id)
             {
-                // Worker-internal idle expiry: publish the tombstone.
-                h.expired = true;
-                h.transaction_id = None;
-                h.transaction_mode = None;
+                let tx = s.transaction_schema.remove(id);
+                if let Some((h, _)) = s.handles.get_mut(id) {
+                    if let Some(tx) = tx {
+                        h.schema_observed = tx.pre_observed;
+                        h.schema_version = tx.pre_version;
+                        h.observation_generation = tx.pre_generation;
+                    }
+                    h.expired = true;
+                    h.transaction_id = None;
+                    h.transaction_mode = None;
+                }
             }
-            classify_worker_error(e, true)
-        })?;
+            if message.contains("handle invalidated") {
+                self.invalidate_handle(id).await;
+                return Err(CoreError::Worker(e));
+            }
+            return Err(classify_worker_error(e, true));
+        }
         let mut s = self.inner.lock().await;
+        let tx = s.transaction_schema.remove(id);
         let Some((h, _)) = s.handles.get_mut(id) else {
-            // The registry entry vanished (global shutdown or invalidation
-            // raced this publication): there is nothing left to publish onto.
-            // Report unknown rather than panicking.
             return Err(CoreError::UnknownHandle);
         };
+        if let Some(tx) = tx {
+            h.schema_observed = tx.pre_observed;
+            h.schema_version = tx.pre_version;
+            h.observation_generation = tx.pre_generation;
+        }
         h.transaction_id = None;
         h.transaction_mode = None;
         Ok(h.clone())
@@ -479,50 +730,134 @@ impl Core {
             .await
     }
     async fn commit_admitted(&self, id: &str) -> Result<Handle, CoreError> {
-        let (gate, _w) = self.handle_gate(id).await?;
+        let (gate, w) = self.handle_gate(id).await?;
         let _operation = gate.lock().await;
         {
-            // Expired tombstone precedes the transaction check: follow-ups on
-            // an expired handle report TX_EXPIRED, never NO_TX_OPEN (AC.4).
             let s = self.inner.lock().await;
             let (h, _) = s.handles.get(id).ok_or(CoreError::UnknownHandle)?;
             if h.expired {
                 return Err(CoreError::TransactionExpired);
             }
         }
-        let w = self.worker(id).await?;
-        w.run_control(|c, _ctx| {
-            test_support::emit(test_support::Event::CommitEntry);
-            if c.is_autocommit() {
-                return Err(WorkerError::Message("no transaction open".into()));
+        let outcome = w
+            .run_commit()
+            .await
+            .map_err(|error| CoreError::CommitLifecycle {
+                error: Box::new(error),
+                commit_confirmed: false,
+                transaction_open: false,
+                transaction_continuable: false,
+                expired: false,
+                uncertain_or_invalidated: true,
+            })?;
+        let commit_confirmed = outcome.commit_confirmed;
+        let transaction_open = outcome.transaction_open;
+        let transaction_continuable = outcome.transaction_continuable;
+        let expired = outcome.expired;
+        let uncertain_or_invalidated = outcome.uncertain_or_invalidated;
+        let (committed_result, committed_schema_version) = match outcome.result {
+            Ok(value) => {
+                let committed = value
+                    .get("committed")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let schema_version = value
+                    .get("schema_version")
+                    .and_then(serde_json::Value::as_i64);
+                (Ok(committed), schema_version)
             }
-            crate::policy::trusted(|| c.execute_batch("COMMIT"))?;
-            test_support::emit(test_support::Event::CommitReturn);
-            Ok(serde_json::json!(true))
-        })
-        .await
-        .map_err(|e| {
-            let message = e.to_string();
-            if message.contains("TRANSACTION_EXPIRED")
-                && let Ok(mut s) = self.inner.try_lock()
-                && let Some((h, _)) = s.handles.get_mut(id)
-            {
-                // Worker-internal idle expiry: publish the tombstone.
-                h.expired = true;
-                h.transaction_id = None;
-                h.transaction_mode = None;
+            Err(error) => (Err(error), None),
+        };
+        if uncertain_or_invalidated {
+            self.invalidate_handle(id).await;
+            return Err(CoreError::CommitLifecycle {
+                error: Box::new(
+                    committed_result
+                        .err()
+                        .unwrap_or_else(|| WorkerError::Message("commit state uncertain".into())),
+                ),
+                commit_confirmed,
+                transaction_open,
+                transaction_continuable,
+                expired,
+                uncertain_or_invalidated: true,
+            });
+        }
+        if !commit_confirmed {
+            if expired {
+                let mut s = self.inner.lock().await;
+                let tx = s.transaction_schema.remove(id);
+                if let Some((h, _)) = s.handles.get_mut(id) {
+                    if let Some(tx) = tx {
+                        h.schema_observed = tx.pre_observed;
+                        h.schema_version = tx.pre_version;
+                        h.observation_generation = tx.pre_generation;
+                    }
+                    h.expired = true;
+                    h.transaction_id = None;
+                    h.transaction_mode = None;
+                }
+            } else if !transaction_open {
+                let mut s = self.inner.lock().await;
+                let tx = s.transaction_schema.remove(id);
+                if let Some((h, _)) = s.handles.get_mut(id) {
+                    if let Some(tx) = tx {
+                        h.schema_observed = tx.pre_observed;
+                        h.schema_version = tx.pre_version;
+                        h.observation_generation = tx.pre_generation;
+                    }
+                    h.transaction_id = None;
+                    h.transaction_mode = None;
+                }
             }
-            classify_worker_error(e, true)
-        })?;
+            if expired {
+                return Err(CoreError::TransactionExpired);
+            }
+            return Err(CoreError::CommitLifecycle {
+                error: Box::new(
+                    committed_result
+                        .err()
+                        .unwrap_or_else(|| WorkerError::Message("commit was not confirmed".into())),
+                ),
+                commit_confirmed,
+                transaction_open,
+                transaction_continuable,
+                expired,
+                uncertain_or_invalidated,
+            });
+        }
         let mut s = self.inner.lock().await;
+        let tx = s.transaction_schema.remove(id);
+        let pending_schema_change = tx.as_ref().is_some_and(|tx| tx.pending_schema_change);
         let Some((h, _)) = s.handles.get_mut(id) else {
-            // The registry entry vanished (global shutdown or invalidation
-            // raced this publication): there is nothing left to publish onto.
-            // Report unknown rather than panicking.
             return Err(CoreError::UnknownHandle);
         };
         h.transaction_id = None;
         h.transaction_mode = None;
-        Ok(h.clone())
+        if pending_schema_change {
+            h.schema_observed = false;
+            h.observation_generation = h.observation_generation.saturating_add(1);
+        }
+        match committed_result {
+            Ok(_) => {
+                if !pending_schema_change
+                    && let Some(version) = committed_schema_version
+                    && h.schema_observed
+                    && version == h.schema_version
+                {
+                    // The full committed observation remains valid. No new
+                    // generation is published by commit.
+                }
+                Ok(h.clone())
+            }
+            Err(error) => Err(CoreError::CommitLifecycle {
+                error: Box::new(error),
+                commit_confirmed,
+                transaction_open,
+                transaction_continuable,
+                expired,
+                uncertain_or_invalidated,
+            }),
+        }
     }
 }

@@ -10,7 +10,8 @@ rust-version = "1.96"
 [workspace.dependencies]
 rmcp = { version = "=1.7.0", default-features = false, features = ["server", "macros", "schemars", "transport-io"] }
 rmcp-macros = "=1.7.0"
-rusqlite = { version = "=0.40.1", features = ["bundled", "hooks", "limits", "column_decltype"] }
+rusqlite = { version = "=0.40.1", features = ["bundled", "hooks", "limits", "column_decltype", "serialize"] }
+sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }

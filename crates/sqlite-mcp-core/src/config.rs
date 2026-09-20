@@ -35,6 +35,14 @@ pub struct Config {
     pub expression_depth: usize,
     #[serde(default = "default_compound_terms")]
     pub compound_terms: usize,
+    #[serde(default = "default_merge_text_byte_limit")]
+    pub merge_text_byte_limit: usize,
+    #[serde(default = "default_merge_statement_limit")]
+    pub merge_statement_limit: usize,
+    #[serde(default = "default_merge_source_observation_byte_limit")]
+    pub merge_source_observation_byte_limit: usize,
+    #[serde(default = "default_merge_image_byte_limit")]
+    pub merge_image_byte_limit: usize,
 }
 fn default_max_handles() -> usize {
     32
@@ -78,6 +86,18 @@ fn default_expression_depth() -> usize {
 fn default_compound_terms() -> usize {
     50
 }
+fn default_merge_text_byte_limit() -> usize {
+    64 * 1024 * 1024
+}
+fn default_merge_statement_limit() -> usize {
+    100_000
+}
+fn default_merge_source_observation_byte_limit() -> usize {
+    256 * 1024 * 1024
+}
+fn default_merge_image_byte_limit() -> usize {
+    64 * 1024 * 1024
+}
 fn default_read_idle() -> u64 {
     600
 }
@@ -99,6 +119,10 @@ impl Default for Config {
             parameter_limit: 1000,
             expression_depth: 100,
             compound_terms: 50,
+            merge_text_byte_limit: default_merge_text_byte_limit(),
+            merge_statement_limit: default_merge_statement_limit(),
+            merge_source_observation_byte_limit: default_merge_source_observation_byte_limit(),
+            merge_image_byte_limit: default_merge_image_byte_limit(),
         }
     }
 }
@@ -113,7 +137,7 @@ pub enum ConfigError {
 }
 impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
-        const POLICY: [(&str, u128, u128); 15] = [
+        const POLICY: [(&str, u128, u128); 19] = [
             ("max_handles", 1, 1024),
             ("queue_capacity", 1, 4096),
             ("query_timeout_ms", 1, 300_000),
@@ -129,6 +153,10 @@ impl Config {
             ("parameter_limit", 1, 32_766),
             ("expression_depth", 1, 1000),
             ("compound_terms", 1, 500),
+            ("merge_text_byte_limit", 1, 67_108_864),
+            ("merge_statement_limit", 1, 1_000_000),
+            ("merge_source_observation_byte_limit", 1, 1_073_741_824),
+            ("merge_image_byte_limit", 1, 1_073_741_824),
         ];
         let values = [
             ("max_handles", self.max_handles as u128),
@@ -146,6 +174,16 @@ impl Config {
             ("parameter_limit", self.parameter_limit as u128),
             ("expression_depth", self.expression_depth as u128),
             ("compound_terms", self.compound_terms as u128),
+            ("merge_text_byte_limit", self.merge_text_byte_limit as u128),
+            ("merge_statement_limit", self.merge_statement_limit as u128),
+            (
+                "merge_source_observation_byte_limit",
+                self.merge_source_observation_byte_limit as u128,
+            ),
+            (
+                "merge_image_byte_limit",
+                self.merge_image_byte_limit as u128,
+            ),
         ];
         for ((policy_field, minimum, maximum), (value_field, value)) in POLICY.iter().zip(values) {
             debug_assert_eq!(*policy_field, value_field);

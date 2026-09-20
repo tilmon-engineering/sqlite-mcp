@@ -31,3 +31,12 @@ column_limit = 256
 parameter_limit = 1000
 expression_depth = 100
 compound_terms = 50
+
+# Merge SQL text cap per artifact/input (1..=67108864).
+merge_text_byte_limit = 67108864
+# Replay statement cap per source/import (1..=1000000).
+merge_statement_limit = 100000
+# SHA-256 source observation cap per main/sidecar file (1..=1073741824).
+merge_source_observation_byte_limit = 268435456
+# Materialized SQLite image cap before output creation (1..=1073741824).
+merge_image_byte_limit = 67108864

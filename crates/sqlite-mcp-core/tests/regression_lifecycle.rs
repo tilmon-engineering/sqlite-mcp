@@ -24,6 +24,7 @@ async fn fixture(
     let core = Core::new(config).unwrap();
     let handle = core.open_database(&p, false).await.unwrap();
     core.get_schema(&handle.id).await.unwrap();
+    test_support::set_clock_ms(0);
     (dir, core, p, handle.id, _hooks)
 }
 
@@ -193,11 +194,13 @@ async fn expired_direct_commit_never_persists() {
     core.query(&id, "INSERT INTO t VALUES (7)", &[])
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    test_support::set_clock_ms(u64::MAX / 2);
     assert!(
         matches!(core.commit(&id).await, Err(CoreError::TransactionExpired)),
         "expired commit was accepted"
     );
+    let _ = core.list_handles().await;
+    test_support::set_clock_ms(0);
     let db = Connection::open(p).unwrap();
     assert_eq!(
         db.query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
@@ -324,7 +327,30 @@ fn interruption_precedence_matrix() {
 #[tokio::test]
 async fn expiry_rollback_failure_invalidates() {
     let (_d, core, _p, id, _hooks) = fixture(Config::default()).await;
-    assert!(core.expire_handle(&id).await.is_ok());
+    core.begin_transaction(&id, "deferred").await.unwrap();
+    test_support::set_clock_ms(u64::MAX / 2);
+    test_support::inject_cleanup_fault(
+        sqlite_mcp_core::CleanupStage::ExpiryRollback,
+        "injected expiry rollback failure",
+    );
+    let result = core.expire_handle(&id).await;
+    test_support::set_clock_ms(0);
+    assert!(!result.unwrap_or(false));
+    assert!(core.list_handles().await.into_iter().any(|h| h.id == id));
+    clean(&core).await;
+}
+
+#[tokio::test]
+async fn rollback_cleanup_uncertainty_invalidates_handle() {
+    let (_d, core, _p, id, _hooks) = fixture(Config::default()).await;
+    core.begin_transaction(&id, "deferred").await.unwrap();
+    test_support::inject_cleanup_fault(
+        sqlite_mcp_core::CleanupStage::ConnectionRollback,
+        "injected rollback uncertainty",
+    );
+    let result = core.rollback(&id).await;
+    assert!(result.is_err());
+    assert!(core.list_handles().await.into_iter().all(|h| h.id != id));
     clean(&core).await;
 }
 

@@ -1,7 +1,9 @@
+mod admission;
 mod config;
 mod core;
 mod envelope;
 mod handles;
+mod merge;
 mod operation;
 mod paths;
 mod policy;
@@ -14,6 +16,9 @@ pub use config::{Config, ConfigError};
 pub use core::{Core, CoreError, QueryResult};
 pub use envelope::{Envelope, ErrorBody, ErrorInfo, HandleState};
 pub use handles::Handle;
+pub use merge::{
+    ExtractionResult, FileByteCounts, Files, ImportResult, ImportValidation, MergeError,
+};
 pub use operation::{
     CleanupFailure, CleanupStage, EffectiveLimits, InterruptionCause, LimitInstallError,
     OperationKind, OperationOutcome, OperationRecord, PublishAction, ShutdownReport,

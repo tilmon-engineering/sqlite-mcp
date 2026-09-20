@@ -3,6 +3,7 @@ use crate::core::error::classify_worker_error;
 use crate::sql::{Cell, cell, validate_with_limit};
 use crate::test_support;
 use crate::worker::WorkerError;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct QueryResult {
     pub columns: Vec<String>,
@@ -12,9 +13,22 @@ pub struct QueryResult {
     pub execution_complete: bool,
     pub changes: u64,
 }
+
+#[derive(Debug)]
+struct QueryExecution {
+    result: QueryResult,
+    schema_before: i64,
+    schema_after: i64,
+    statement_succeeded: bool,
+    transaction_open: bool,
+    transaction_continuable: bool,
+    cleanup_uncertain: bool,
+}
+
 fn serialized_selected_payload(result: &QueryResult) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(&serde_json::json!({ "columns": &result.columns, "rows": &result.rows }))
 }
+
 impl Core {
     pub async fn query(
         &self,
@@ -24,6 +38,7 @@ impl Core {
     ) -> Result<QueryResult, CoreError> {
         self.query_with_ct(id, sql, params, None).await
     }
+
     pub async fn query_with_ct(
         &self,
         id: &str,
@@ -49,6 +64,7 @@ impl Core {
         self.coordinate(async move { this.query_admitted(&owned_id, statement, values, ct).await })
             .await
     }
+
     async fn query_admitted(
         &self,
         id: &str,
@@ -61,7 +77,12 @@ impl Core {
         let (expected_version, observed, expired) = {
             let s = self.inner.lock().await;
             let (h, _) = s.handles.get(id).ok_or(CoreError::UnknownHandle)?;
-            (h.schema_version, h.schema_observed, h.expired)
+            let expected = s
+                .transaction_schema
+                .get(id)
+                .map(|tx| tx.expected_version)
+                .unwrap_or(h.schema_version);
+            (expected, h.schema_observed, h.expired)
         };
         if !observed {
             return Err(CoreError::SchemaRequired);
@@ -73,6 +94,8 @@ impl Core {
         let result_byte_limit = self.config.result_byte_limit;
         let column_limit = self.config.column_limit;
         let w = self.worker(id).await?;
+        // The marker is still drained for every admitted request. It classifies
+        // policy activity only; schema freshness is decided by cookie deltas.
         let mutation_signal = w.mutation_seen.clone();
         let out = w
             .run_with_optional_token(
@@ -82,18 +105,14 @@ impl Core {
                     if c.is_autocommit() {
                         return Err(WorkerError::Message("transaction required".into()));
                     }
-                    let current: i64 = crate::policy::trusted(|| {
+                    let before: i64 = crate::policy::trusted(|| {
                         c.query_row("PRAGMA schema_version", [], |r| r.get(0))
                     })?;
-                    if current != expected_version {
+                    if before != expected_version {
                         return Err(WorkerError::Message("SCHEMA_STALE".into()));
                     }
                     // Exactly-one-statement structural validation against the
-                    // real connection BEFORE any execution. Multiple or empty
-                    // input is rejected outright; a Denied here means the
-                    // parser rejected the SQL (e.g. malformed tail), which the
-                    // real prepare below reports precisely inside the
-                    // savepoint, so no prefix can execute first.
+                    // real connection BEFORE any execution.
                     match crate::policy::prepare_exact(c, &statement) {
                         Err(crate::policy::PolicyError::Multiple) => {
                             return Err(WorkerError::Message(
@@ -172,7 +191,23 @@ impl Core {
                                 });
                             }
                             crate::policy::trusted(|| c.execute_batch("RELEASE agent_stmt"))?;
-                            serde_json::to_value(x).map_err(|e| WorkerError::Message(e.to_string()))
+                            let after: i64 = crate::policy::trusted(|| {
+                                c.query_row("PRAGMA schema_version", [], |r| r.get(0))
+                            })?;
+                            Ok(serde_json::json!({
+                                "columns": x.columns,
+                                "rows": x.rows,
+                                "rows_returned": x.rows_returned,
+                                "truncated": x.truncated,
+                                "execution_complete": x.execution_complete,
+                                "changes": x.changes,
+                                "schema_before": before,
+                                "schema_after": after,
+                                "statement_succeeded": true,
+                                "transaction_open": !c.is_autocommit(),
+                                "transaction_continuable": !c.is_autocommit(),
+                                "cleanup_uncertain": false
+                            }))
                         }
                         Err(e) => {
                             if c.is_autocommit() {
@@ -195,19 +230,11 @@ impl Core {
                 },
             )
             .await;
-        let out_ok = out.is_ok();
-        let attempted = w.mutation_seen.take_after_request();
-        let ddl_attempted = w.mutation_seen.take_ddl_after_request();
-        // F-06 invalidation policy: a DDL attempt invalidates regardless of
-        // outcome; a DML attempt invalidates only on success; a failed DML
-        // leaves the handle usable (statement atomicity).
-        if ddl_attempted || (attempted && out_ok) {
-            let mut s = self.inner.lock().await;
-            if let Some((h, _)) = s.handles.get_mut(id) {
-                h.schema_observed = false;
-                h.observation_generation = h.observation_generation.saturating_add(1);
-            }
-        }
+        // Always drain both authorizer classifications, including pre-dispatch
+        // policy failures and failed statements, so queued requests cannot
+        // inherit another request's marker.
+        let _attempted = w.mutation_seen.take_after_request();
+        let _ddl_attempted = w.mutation_seen.take_ddl_after_request();
         let out = match out {
             Ok(v) => v,
             Err(e) => {
@@ -217,44 +244,35 @@ impl Core {
                 } = e
                 {
                     let mut s = self.inner.lock().await;
+                    let tx = s.transaction_schema.remove(id);
                     if let Some((h, _)) = s.handles.get_mut(id) {
+                        if let Some(tx) = tx {
+                            h.schema_observed = tx.pre_observed;
+                            h.schema_version = tx.pre_version;
+                            h.observation_generation = tx.pre_generation;
+                        }
                         h.transaction_id = None;
                         h.transaction_mode = None;
                     }
                 }
                 let message = e.to_string();
                 if message.contains("TRANSACTION_EXPIRED") {
-                    // Worker-internal idle expiry: publish the tombstone so
-                    // close/follow-ups see the truthful expired state.
                     let mut s = self.inner.lock().await;
+                    let tx = s.transaction_schema.remove(id);
                     if let Some((h, _)) = s.handles.get_mut(id) {
+                        if let Some(tx) = tx {
+                            h.schema_observed = tx.pre_observed;
+                            h.schema_version = tx.pre_version;
+                            h.observation_generation = tx.pre_generation;
+                        }
                         h.expired = true;
                         h.transaction_id = None;
                         h.transaction_mode = None;
                     }
+                    return Err(CoreError::TransactionExpired);
                 }
                 if message.contains("handle invalidated") {
-                    // Cleanup could not establish a safe state: drop the
-                    // handle entirely so later calls require reopening.
-                    let w = {
-                        let mut s = self.inner.lock().await;
-                        if let Some(identity_key) = s
-                            .identities
-                            .iter()
-                            .find(|(_, v)| v.as_str() == id)
-                            .map(|(k, _)| *k)
-                        {
-                            s.identities.remove(&identity_key);
-                        }
-                        s.gates.remove(id);
-                        s.handles.remove(id).map(|(_, w)| w)
-                    };
-                    if let Some(w) = w {
-                        // The original "handle invalidated" error below already
-                        // reports the uncertainty; the shutdown status cannot
-                        // improve it further on this path.
-                        let _ = w.shutdown().await;
-                    }
+                    self.invalidate_handle(id).await;
                 }
                 if message.contains("SCHEMA_STALE") {
                     return Err(CoreError::SchemaStale);
@@ -265,8 +283,77 @@ impl Core {
         if out == serde_json::json!("SCHEMA_STALE") {
             return Err(CoreError::SchemaStale);
         }
-        let result: QueryResult = serde_json::from_value(out)
-            .map_err(|e| CoreError::Worker(WorkerError::Message(e.to_string())))?;
-        Ok(result)
+        let value = out.as_object().ok_or_else(|| {
+            CoreError::Worker(WorkerError::Message("invalid query outcome".into()))
+        })?;
+        let execution = QueryExecution {
+            result: QueryResult {
+                columns: serde_json::from_value(value.get("columns").cloned().unwrap_or_default())
+                    .map_err(|e| CoreError::Worker(WorkerError::Message(e.to_string())))?,
+                rows: serde_json::from_value(value.get("rows").cloned().unwrap_or_default())
+                    .map_err(|e| CoreError::Worker(WorkerError::Message(e.to_string())))?,
+                rows_returned: value
+                    .get("rows_returned")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize,
+                truncated: value
+                    .get("truncated")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                execution_complete: value
+                    .get("execution_complete")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                changes: value
+                    .get("changes")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            },
+            schema_before: value
+                .get("schema_before")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(expected_version),
+            schema_after: value
+                .get("schema_after")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(expected_version),
+            statement_succeeded: value
+                .get("statement_succeeded")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            transaction_open: value
+                .get("transaction_open")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            transaction_continuable: value
+                .get("transaction_continuable")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            cleanup_uncertain: value
+                .get("cleanup_uncertain")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        };
+        if execution.cleanup_uncertain {
+            return Err(CoreError::Worker(WorkerError::Message(
+                "query cleanup state uncertain; handle invalidated".into(),
+            )));
+        }
+        if !execution.transaction_open || !execution.transaction_continuable {
+            return Err(CoreError::Worker(WorkerError::Message(
+                "outer transaction aborted".into(),
+            )));
+        }
+        if execution.statement_succeeded && execution.schema_after != execution.schema_before {
+            let mut s = self.inner.lock().await;
+            let Some(tx) = s.transaction_schema.get_mut(id) else {
+                return Err(CoreError::Worker(WorkerError::Message(
+                    "transaction schema state missing after query".into(),
+                )));
+            };
+            tx.expected_version = execution.schema_after;
+            tx.pending_schema_change = true;
+        }
+        Ok(execution.result)
     }
 }

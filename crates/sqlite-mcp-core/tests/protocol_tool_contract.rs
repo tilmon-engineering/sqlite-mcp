@@ -50,6 +50,18 @@ async fn tool_contract_and_bootstrap() {
                 assert!(!required.iter().any(|v| v == "mode"));
             }
             "list_handles" => assert!(required.is_empty()),
+            "extract_sqlite_merge" => {
+                for field in ["base_path", "ours_path", "theirs_path"] {
+                    assert!(required.iter().any(|v| v == field));
+                }
+                assert_eq!(properties.len(), 3);
+            }
+            "import_sqlite_text" => {
+                for field in ["sql_path", "output_path"] {
+                    assert!(required.iter().any(|v| v == field));
+                }
+                assert_eq!(properties.len(), 2);
+            }
             _ => assert!(required.iter().any(|v| v == "handle")),
         }
         let description = tool

@@ -44,11 +44,17 @@ async fn envelope_state_matrix() {
         )
         .await;
     assert_envelope(&ddl, false);
-    // Transaction-local DDL invalidates the observation conservatively;
-    // re-observe before further queries (get_schema stays allowed when stale).
-    let reobserve = fixture.call("get_schema", json!({"handle": id})).await;
-    assert_envelope(&reobserve, false);
-    let dml = fixture.call("query", json!({"handle": id, "sql": "INSERT INTO items (name) VALUES (?)", "parameters": [{"type":"text","value":"one"}]})).await;
+    // Actual DDL remains usable for subsequent statements in the same
+    // transaction; handle_state still reports the committed observation.
+    let follow_up = fixture.call("query", json!({"handle": id, "sql": "INSERT INTO items (name) VALUES (?)", "parameters": [{"type":"text","value":"one"}]})).await;
+    let follow_up_value = assert_envelope(&follow_up, false);
+    assert_eq!(follow_up_value["handle_state"]["schema_observed"], true);
+    let dml = fixture
+        .call(
+            "query",
+            json!({"handle": id, "sql": "SELECT count(*) FROM items"}),
+        )
+        .await;
     assert_envelope(&dml, false);
     let committed = fixture.call("commit", json!({"handle": id})).await;
     assert_envelope(&committed, false);

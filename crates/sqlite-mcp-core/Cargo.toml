@@ -12,6 +12,7 @@ test-support = []
 rmcp.workspace = true
 rmcp-macros.workspace = true
 rusqlite.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 serde.workspace = true

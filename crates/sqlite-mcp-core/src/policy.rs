@@ -16,10 +16,10 @@ thread_local! {
 /// the worker finishes a request regardless of which thread observed it.
 ///
 /// Two signals are tracked: a mutation attempt (any DML/DDL authorizer action)
-/// and whether that attempt was DDL-classified. Invalidation policy (F-06):
-/// a DDL attempt invalidates the schema observation whatever its outcome, a
-/// DML attempt invalidates only on success, and a failed DML leaves the
-/// handle usable (transaction-local statement atomicity).
+/// and whether that attempt was DDL-classified. These are classification
+/// markers only. Core drains them unconditionally after each dispatched
+/// request; schema freshness is decided by the SQLite schema-cookie delta and
+/// confirmed statement outcome, not by authorizer classification alone.
 #[derive(Clone, Default)]
 pub struct MutationSignal {
     attempted: std::sync::Arc<AtomicBool>,
@@ -195,8 +195,9 @@ pub fn check_stored_body(sql: &str, mutation_seen: &MutationSignal) -> Result<()
         cursor.next();
         cursor.next();
         cursor.next();
-        // A structurally denied stored-body CREATE VIEW/TRIGGER is an
-        // attempted DDL: the classification matters for invalidation (F-06).
+        // A structurally denied stored-body CREATE VIEW/TRIGGER is still
+        // classified as DDL so the request marker is drained consistently;
+        // it does not by itself invalidate a committed schema observation.
         mutation_seen.mark_ddl_attempt();
         if cursor.rest.to_ascii_lowercase().contains("pragma_") {
             return Err(PolicyError::Denied);
