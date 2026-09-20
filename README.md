@@ -45,7 +45,7 @@ Copy [`config.example.toml`](config.example.toml). Configuration is process-wide
 | `result_row_limit` | `500` | Positive; 1..=100000. Maximum returned rows. |
 | `result_byte_limit` | `1048576` | Positive; 1..=67108864. Maximum serialized selected result payload (columns+rows) bytes. |
 | `schema_byte_limit` | `2097152` | Positive; 1..=67108864. Maximum complete schema payload bytes. |
-| `busy_wait_ms` | `2000` | Positive; 1..=60000. Bounded busy/locked wait in milliseconds. |
+| `busy_wait_ms` | `2000` | Positive; 1..=60000. Bounded busy/locked wait in milliseconds. Lock contention waits at most `busy_wait_ms` and then reports `BUSY`. |
 | `sql_byte_limit` | `102400` | Positive; 1..=1048576. Maximum SQL text bytes. |
 | `cell_byte_limit` | `1048576` | Positive; 1..=67108864. Maximum individual SQLite value bytes. |
 | `column_limit` | `256` | Positive; 1..=2048. Maximum result columns. |

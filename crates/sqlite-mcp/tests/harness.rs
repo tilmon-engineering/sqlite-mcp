@@ -44,6 +44,9 @@ fn event_debug_name(event: Event) -> &'static str {
         Event::CreationPostOpenCheckpoint => "CreationPostOpenCheckpoint",
         Event::CreationPostInitCheckpoint => "CreationPostInitCheckpoint",
         Event::HarnessCommand => "HarnessCommand",
+        Event::GuardInstalled => "GuardInstalled",
+        Event::FirstSqliteOperation => "FirstSqliteOperation",
+        Event::GuardCleared => "GuardCleared",
     }
 }
 

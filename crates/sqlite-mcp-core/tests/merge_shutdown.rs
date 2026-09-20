@@ -5,8 +5,18 @@ use serde_json::json;
 use std::fs;
 use support::{Fixture, structured};
 
+/// The no-side-effect assertions list the shared temp directory, so the
+/// tests in this file serialize to keep concurrent merge workspaces from
+/// other cases out of the before/after comparison.
+static SERIALIZE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn serialized() -> tokio::sync::MutexGuard<'static, ()> {
+    SERIALIZE.lock().await
+}
+
 #[tokio::test]
 async fn merge_call_after_shutdown_has_no_side_effects() {
+    let _serial = serialized().await;
     let fixture = Fixture::new().await;
     let base = fixture.dir.path().join("base.sqlite");
     let ours = fixture.dir.path().join("ours.sqlite");
@@ -46,6 +56,7 @@ async fn merge_call_after_shutdown_has_no_side_effects() {
 
 #[tokio::test]
 async fn pre_cancelled_merge_has_no_workspace_side_effect() {
+    let _serial = serialized().await;
     let fixture = Fixture::new().await;
     let paths = [
         fixture.dir.path().join("base.sqlite"),
@@ -77,6 +88,7 @@ async fn pre_cancelled_merge_has_no_workspace_side_effect() {
 
 #[tokio::test]
 async fn extraction_rejects_present_sidecars_before_workspace_publication() {
+    let _serial = serialized().await;
     let fixture = Fixture::new().await;
     let paths = [
         fixture.dir.path().join("base.sqlite"),

@@ -196,6 +196,33 @@ fn ok_with_moves(
     let envelope = json!({"envelope_version":1,"handle_state":handle.map(state),"next_moves":moves.unwrap_or_else(|| next(tool)),"result":result});
     CallToolResult::structured(envelope)
 }
+/// A BUSY commit is classified as the retryable `BUSY` class only when every
+/// observed lifecycle field agrees: the commit was not confirmed, the state
+/// is not uncertain/invalidated, the worker observed the transaction still
+/// open (continuable), and the nested SQLite primary code is BUSY or LOCKED.
+/// A confirmed or autocommit-restored lifecycle, or an uncertain one, keeps
+/// its truthful class and must never be presented as retryable `BUSY`.
+fn commit_lifecycle_is_retryable_busy(
+    error: &crate::worker::WorkerError,
+    commit_confirmed: bool,
+    transaction_open: bool,
+    uncertain_or_invalidated: bool,
+) -> bool {
+    if commit_confirmed || uncertain_or_invalidated || !transaction_open {
+        return false;
+    }
+    match error {
+        crate::worker::WorkerError::Sqlite(e) => match e.sqlite_extended_error_code() {
+            Some(extended) => {
+                let primary = extended & 0xff;
+                primary == rusqlite::ffi::SQLITE_BUSY || primary == rusqlite::ffi::SQLITE_LOCKED
+            }
+            None => false,
+        },
+        _ => false,
+    }
+}
+
 fn error(tool: &str, err: CoreError, handle: Option<&Handle>) -> CallToolResult {
     let class = match &err {
         CoreError::UnknownHandle => "HANDLE_UNKNOWN",
@@ -214,6 +241,21 @@ fn error(tool: &str, err: CoreError, handle: Option<&Handle>) -> CallToolResult 
         CoreError::InvalidDatabase => "INVALID_DATABASE",
         CoreError::ServerShutdown => "SERVER_SHUTDOWN",
         CoreError::Merge(merge) => merge.class,
+        CoreError::CommitLifecycle {
+            error,
+            commit_confirmed,
+            transaction_open,
+            uncertain_or_invalidated,
+            ..
+        } if commit_lifecycle_is_retryable_busy(
+            error,
+            *commit_confirmed,
+            *transaction_open,
+            *uncertain_or_invalidated,
+        ) =>
+        {
+            "BUSY"
+        }
         _ if err.to_string().contains("no transaction") => "NO_TX_OPEN",
         _ if err.to_string().contains("transaction required") => "NO_TX_OPEN",
         _ if err.to_string().to_ascii_lowercase().contains("busy") => "BUSY",
@@ -593,5 +635,76 @@ impl McpServer {
     }
     pub fn server_info() -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::WorkerError;
+
+    fn sqlite_busy(code: i32) -> WorkerError {
+        WorkerError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some(format!("sqlite code {code}")),
+        ))
+    }
+
+    #[test]
+    fn commit_lifecycle_busy_classification_matrix() {
+        // Nested BUSY/LOCKED with an open, unconfirmed, certain transaction
+        // is the retryable public BUSY class.
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_BUSY_SNAPSHOT,
+        ] {
+            assert!(
+                commit_lifecycle_is_retryable_busy(&sqlite_busy(code), false, true, false),
+                "nested sqlite code {code} must classify as retryable BUSY"
+            );
+        }
+        // A non-SQLite lifecycle error is never retryable BUSY.
+        assert!(!commit_lifecycle_is_retryable_busy(
+            &WorkerError::Message("commit was not confirmed".into()),
+            false,
+            true,
+            false
+        ));
+        // An uncertain/invalidated lifecycle keeps its truthful class.
+        assert!(!commit_lifecycle_is_retryable_busy(
+            &sqlite_busy(rusqlite::ffi::SQLITE_BUSY),
+            false,
+            true,
+            true
+        ));
+        // A confirmed commit (autocommit restored or otherwise) is never
+        // retryable BUSY, even with a nested error.
+        assert!(!commit_lifecycle_is_retryable_busy(
+            &sqlite_busy(rusqlite::ffi::SQLITE_BUSY),
+            true,
+            false,
+            false
+        ));
+        assert!(!commit_lifecycle_is_retryable_busy(
+            &sqlite_busy(rusqlite::ffi::SQLITE_BUSY),
+            true,
+            true,
+            false
+        ));
+        // A closed transaction is not retryable.
+        assert!(!commit_lifecycle_is_retryable_busy(
+            &sqlite_busy(rusqlite::ffi::SQLITE_BUSY),
+            false,
+            false,
+            false
+        ));
+        // Non-busy SQLite codes are not retryable BUSY.
+        assert!(!commit_lifecycle_is_retryable_busy(
+            &sqlite_busy(rusqlite::ffi::SQLITE_FULL),
+            false,
+            true,
+            false
+        ));
     }
 }

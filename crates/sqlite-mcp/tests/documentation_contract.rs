@@ -41,3 +41,12 @@ fn readme_documents_maintenance_denial() {
         "README must document maintenance and extension-loading denial"
     );
 }
+
+#[test]
+fn readme_documents_busy_wait_bound() {
+    let readme = readme();
+    assert!(
+        readme.contains("Lock contention waits at most `busy_wait_ms` and then reports `BUSY`"),
+        "README must document the busy_wait_ms bound and BUSY reporting"
+    );
+}

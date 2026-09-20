@@ -6,8 +6,24 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 mod limits;
+/// State of the currently active bounded busy window. `None` in the
+/// thread-local slot means no window is active and SQLITE_BUSY surfaces
+/// immediately.
+#[derive(Clone)]
+struct BusyState {
+    /// Request cancellation token; `None` for non-cancellable cleanup
+    /// windows.
+    token: Option<CancelToken>,
+    /// Request deadline; `None` for non-cancellable cleanup windows.
+    deadline: Option<Instant>,
+    /// Configured per-request busy budget (`busy_wait_ms`).
+    budget: Duration,
+    /// Instant of the first retry in this window; the budget is measured
+    /// from here so each request gets a full, fresh budget.
+    first_retry: Option<Instant>,
+}
 thread_local! {
-    static BUSY_CONTEXT: std::cell::RefCell<Option<(CancelToken, Instant)>> = const { std::cell::RefCell::new(None) };
+    static BUSY_CONTEXT: std::cell::RefCell<Option<BusyState>> = const { std::cell::RefCell::new(None) };
     /// Worker-lifetime shutdown token: consulted by busy retries and progress
     /// callbacks so shutdown interrupts active work (F-03).
     static SHUTDOWN_TOKEN: std::cell::RefCell<Option<CancelToken>> = const { std::cell::RefCell::new(None) };
@@ -26,16 +42,115 @@ fn busy_retry(_count: i32) -> bool {
         return false;
     }
     BUSY_CONTEXT.with(|ctx| {
-        let binding = ctx.borrow();
-        let Some((token, deadline)) = binding.as_ref() else {
+        let mut binding = ctx.borrow_mut();
+        let Some(state) = binding.as_mut() else {
             return false;
         };
-        if token.is_cancelled() || Instant::now() >= *deadline {
+        if state.token.as_ref().is_some_and(CancelToken::is_cancelled) {
+            return false;
+        }
+        if let Some(deadline) = state.deadline
+            && Instant::now() >= deadline
+        {
+            return false;
+        }
+        let now = Instant::now();
+        let first = *state.first_retry.get_or_insert(now);
+        // The bounded busy wait is capped at `busy_wait_ms` per request;
+        // exhaustion surfaces SQLITE_BUSY (DESIGN §4).
+        if now >= first + state.budget {
             return false;
         }
         std::thread::sleep(Duration::from_millis(10));
         true
     })
+}
+
+/// Monotonic id for guard/first-operation event keys so each emission is
+/// individually addressable by the deterministic worker fixture.
+fn guard_event_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
+
+fn guard_event_key(command: &'static str, branch: &'static str) -> test_support::EventKey {
+    test_support::EventKey {
+        operation_id: guard_event_seq(),
+        generation: 0,
+        worker_id: Some(format!("{command}:{branch}")),
+        creation_id: None,
+    }
+}
+
+fn emit_guard_installed(command: &'static str, branch: &'static str) {
+    test_support::emit_keyed(
+        test_support::Event::GuardInstalled,
+        Some(guard_event_key(command, branch)),
+    );
+}
+
+fn emit_first_sqlite_operation(command: &'static str, branch: &'static str) {
+    test_support::emit_keyed(
+        test_support::Event::FirstSqliteOperation,
+        Some(guard_event_key(command, branch)),
+    );
+}
+
+/// RAII bounded busy window for one worker command arm. Installing swaps a
+/// fresh [`BusyState`] into the thread-local slot (the `busy_retry` handler
+/// itself is installed once for the worker lifetime); dropping clears the
+/// slot unconditionally on every exit path of the scoped arm, so no context
+/// leaks across commands and no command path runs without a bounded window.
+///
+/// The arm-level guard starts as a non-cancellable budget-only window (it
+/// covers the arm's pre-checks and expiry rollbacks); the Run main path
+/// swaps in the request-scoped window (request token + deadline) around the
+/// job, and swaps back to a fresh non-cancellable window for post-request
+/// cleanup, so cleanup never inherits an expired or cancelled request
+/// context.
+struct BusyGuard {
+    command: &'static str,
+    branch: &'static str,
+}
+
+impl BusyGuard {
+    fn install(command: &'static str, branch: &'static str, budget: Duration) -> Self {
+        Self::set_window(command, branch, None, None, budget);
+        Self { command, branch }
+    }
+    fn enter_request(&self, token: CancelToken, deadline: Instant, budget: Duration) {
+        Self::set_window(self.command, "request", Some(token), Some(deadline), budget);
+    }
+    fn enter_cleanup(&self, budget: Duration) {
+        Self::set_window(self.command, "cleanup", None, None, budget);
+    }
+    fn set_window(
+        command: &'static str,
+        branch: &'static str,
+        token: Option<CancelToken>,
+        deadline: Option<Instant>,
+        budget: Duration,
+    ) {
+        BUSY_CONTEXT.with(|slot| {
+            *slot.borrow_mut() = Some(BusyState {
+                token,
+                deadline,
+                budget,
+                first_retry: None,
+            })
+        });
+        emit_guard_installed(command, branch);
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        BUSY_CONTEXT.with(|slot| *slot.borrow_mut() = None);
+        test_support::emit_keyed(
+            test_support::Event::GuardCleared,
+            Some(guard_event_key(self.command, self.branch)),
+        );
+    }
 }
 #[derive(Clone)]
 pub struct CancelToken(CancellationToken);
@@ -216,6 +331,11 @@ impl Worker {
                     );
                     let _ = policy::trusted(|| conn.pragma_update(None, "foreign_keys", true));
                     let _ = conn.busy_timeout(Duration::from_millis(busy_wait_ms));
+                    // The bounded busy handler is installed once for the
+                    // worker lifetime; per-request windows are managed by
+                    // BusyGuard in each command arm. With no window active a
+                    // lock conflict surfaces SQLITE_BUSY immediately.
+                    let _ = conn.busy_handler(Some(busy_retry));
                     if limits::install_limits(conn, &limits).is_err() {
                         return;
                     }
@@ -231,6 +351,7 @@ impl Worker {
                         limits.column_limit,
                     );
                     while let Some(cmd) = rx.blocking_recv() {
+                        let busy_budget = Duration::from_millis(busy_wait_ms);
                         match cmd {
                             Command::Run(f, ctx, r) => {
                                 test_support::emit(test_support::Event::AdmissionDequeue);
@@ -248,9 +369,11 @@ impl Worker {
                                     )));
                                     continue;
                                 }
+                                let _busy_guard = BusyGuard::install("run", "arm", busy_budget);
                                 if test_support::now_ms() >= idle_deadline
                                     && !conn.is_autocommit()
                                 {
+                                    emit_first_sqlite_operation("run", "idle-expiry");
                                     let _ = policy::trusted(|| conn.execute_batch("ROLLBACK"));
                                     expired = true;
                                     let _ = r.send(Err(WorkerError::Message(
@@ -278,10 +401,7 @@ impl Worker {
                                 thread_flag.reset_for_request();
                                 let token = ctx.token.clone();
                                 let deadline = ctx.deadline;
-                                BUSY_CONTEXT.with(|slot| {
-                                    *slot.borrow_mut() = Some((token.clone(), deadline))
-                                });
-                                let _ = conn.busy_handler(Some(busy_retry));
+                                _busy_guard.enter_request(token.clone(), deadline, busy_budget);
                                 let shutdown_flag = SHUTDOWN_TOKEN
                                     .with(|slot| slot.borrow().as_ref().map(|t| t.0.clone()));
                                 let _ = conn.progress_handler(
@@ -294,11 +414,16 @@ impl Worker {
                                             || Instant::now() >= deadline
                                     }),
                                 );
+                                emit_first_sqlite_operation("run", "request");
                                 let mut result = f(conn, &ctx);
                                 test_support::emit(test_support::Event::BeginCompletion);
                                 let _ = conn.progress_handler(0, None::<fn() -> bool>);
-                                let _ = conn.busy_handler(None);
-                                BUSY_CONTEXT.with(|slot| *slot.borrow_mut() = None);
+                                // Post-request cleanup (rollback verification,
+                                // expiry accounting) runs under a fresh
+                                // non-cancellable bounded window, never the
+                                // drained request context.
+                                _busy_guard.enter_cleanup(busy_budget);
+                                emit_first_sqlite_operation("run", "cleanup");
                                 if ctx.token.is_cancelled() {
                                     // The interrupt may already have aborted the
                                     // whole outer transaction: "no transaction is
@@ -417,11 +542,14 @@ impl Worker {
                             }
                             Command::Control(f, r) => {
                                 test_support::emit(test_support::Event::ControlEntry);
+                                let _busy_guard =
+                                    BusyGuard::install("control", "arm", busy_budget);
                                 if expired {
                                     let _ = r.send(Err(WorkerError::Message("TRANSACTION_EXPIRED".into())));
                                     continue;
                                 }
                                 if !conn.is_autocommit() && test_support::now_ms() >= idle_deadline {
+                                    emit_first_sqlite_operation("control", "expiry");
                                     let injected = test_support::take_cleanup_fault(crate::operation::CleanupStage::ExpiryRollback).is_some();
                                     let rollback = if injected {
                                         Err(rusqlite::Error::InvalidQuery)
@@ -437,6 +565,7 @@ impl Worker {
                                     continue;
                                 }
                                 // Control cleanup is deliberately not wired to a request token.
+                                emit_first_sqlite_operation("control", "normal");
                                 let result = f(
                                     conn,
                                     &RequestContext::new(Duration::from_secs(365 * 24 * 60 * 60)),
@@ -447,7 +576,9 @@ impl Worker {
                             }
                             Command::Commit(r) => {
                                 test_support::emit(test_support::Event::CommitEntry);
+                                let _busy_guard = BusyGuard::install("commit", "arm", busy_budget);
                                 if !expired && !conn.is_autocommit() && test_support::now_ms() >= idle_deadline {
+                                    emit_first_sqlite_operation("commit", "expiry");
                                     let rollback = policy::trusted(|| conn.execute_batch("ROLLBACK"));
                                     if rollback.is_ok() && conn.is_autocommit() {
                                         expired = true;
@@ -462,9 +593,11 @@ impl Worker {
                                     continue;
                                 }
                                 if conn.is_autocommit() {
+                                    emit_first_sqlite_operation("commit", "no-transaction");
                                     let _ = r.send(CommitOutcome::failure(Err(WorkerError::Message("no transaction open".into())), false, false, false));
                                     continue;
                                 }
+                                emit_first_sqlite_operation("commit", "normal");
                                 let fault = test_support::take_commit_fault();
                                 let commit = match fault {
                                     Some(test_support::CommitFault::OpenContinuable) => Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY), Some("injected open continuable commit fault".into()))),
@@ -505,6 +638,8 @@ impl Worker {
                                 }
                             }
                             Command::Expire(r) => {
+                                let _busy_guard = BusyGuard::install("expire", "arm", busy_budget);
+                                emit_first_sqlite_operation("expire", "normal");
                                 let expired = !conn.is_autocommit();
                                 if expired {
                                     let injected = test_support::take_cleanup_fault(crate::operation::CleanupStage::ExpiryRollback).is_some();
@@ -521,6 +656,9 @@ impl Worker {
                                 let _ = r.send(expired);
                             }
                             Command::Shutdown(r) => {
+                                let _busy_guard =
+                                    BusyGuard::install("shutdown", "arm", busy_budget);
+                                emit_first_sqlite_operation("shutdown", "cleanup");
                                 // Verify rollback before reporting: a rollback
                                 // error with autocommit not restored leaves the
                                 // connection state uncertain.
@@ -757,5 +895,341 @@ impl Worker {
             })
             .await
             .clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy;
+    use crate::test_support::{self, Event};
+    use std::sync::atomic::Ordering;
+
+    /// Deterministic bounded-busy-window fixture: drives the worker command
+    /// arms directly under the SQLITE_MCP_TEST_SUPPORT gate with the injected
+    /// clock and asserts the guard ordering invariants — every command arm
+    /// installs a bounded busy window before its first SQLite operation,
+    /// clears it exactly once on every exit path, and leaves no window
+    /// behind for the next command.
+    /// Env-var manipulation is process-global, so the fixture tests
+    /// serialize on this lock (cargo test runs them on parallel threads).
+    static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct SupportGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+    impl SupportGuard {
+        fn enable() -> Self {
+            let guard = FIXTURE_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            // SAFETY: the fixture lock serializes every test that touches the
+            // marker, and the marker is removed before the guard releases.
+            unsafe {
+                std::env::set_var("SQLITE_MCP_TEST_SUPPORT", "1");
+            }
+            test_support::reset_registry();
+            // Take control of the injected clock (0 means "real time").
+            test_support::set_clock_ms(1);
+            SupportGuard(guard)
+        }
+    }
+    impl Drop for SupportGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("SQLITE_MCP_TEST_SUPPORT");
+            }
+            test_support::reset_registry();
+        }
+    }
+
+    fn seqs(event: Event, label: &str) -> Vec<u64> {
+        test_support::retained_records(event)
+            .into_iter()
+            .filter(|record| {
+                record.key.as_ref().and_then(|key| key.worker_id.as_deref()) == Some(label)
+            })
+            .map(|record| record.order)
+            .collect()
+    }
+
+    fn one_seq(event: Event, label: &str) -> u64 {
+        let seqs = seqs(event, label);
+        assert_eq!(
+            seqs.len(),
+            1,
+            "expected exactly one {event:?} for {label:?}, got {seqs:?}"
+        );
+        seqs[0]
+    }
+
+    /// Assert the arm invariant across every observed command of this kind:
+    /// each command installs its guard before any branch's first SQLite
+    /// operation, clears it exactly once before the next command's guard,
+    /// and windows never overlap.
+    fn assert_arm_window(command: &str, branches: &[&str]) {
+        let arm = format!("{command}:arm");
+        let mut installs = seqs(Event::GuardInstalled, &arm);
+        let mut cleared = seqs(Event::GuardCleared, &arm);
+        installs.sort_unstable();
+        cleared.sort_unstable();
+        assert!(
+            !installs.is_empty(),
+            "{command}: no guard window observed at all"
+        );
+        assert_eq!(
+            installs.len(),
+            cleared.len(),
+            "{command}: guard install/clear count imbalance (installs={installs:?}, cleared={cleared:?})"
+        );
+        for (install, clear) in installs.iter().zip(&cleared) {
+            assert!(
+                install < clear,
+                "{command}: guard cleared before installed ({install} >= {clear})"
+            );
+        }
+        for (clear, next_install) in cleared.iter().zip(installs.iter().skip(1)) {
+            assert!(
+                clear < next_install,
+                "{command}: guard windows overlap ({clear} >= {next_install})"
+            );
+        }
+        for branch in branches {
+            let label = format!("{command}:{branch}");
+            let firsts = seqs(Event::FirstSqliteOperation, &label);
+            assert!(
+                !firsts.is_empty(),
+                "{command}: no first SQLite operation observed for {branch:?}"
+            );
+            for first in firsts {
+                let inside = installs
+                    .iter()
+                    .zip(&cleared)
+                    .any(|(install, clear)| install < &first && &first < clear);
+                assert!(
+                    inside,
+                    "{command}: first operation for {branch:?} at order {first} is outside every \
+                     guard window (installs={installs:?}, cleared={cleared:?})"
+                );
+            }
+        }
+    }
+
+    fn start_test_worker(idle_seconds: u64) -> (tempfile::TempDir, Worker) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker-fixture.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE t(a)").unwrap();
+        }
+        let worker = Worker::start(
+            path.to_str().unwrap().to_owned(),
+            false,
+            8,
+            idle_seconds,
+            50,
+            limits::WorkerLimits {
+                cell_byte_limit: 1_048_576,
+                sql_byte_limit: 102_400,
+                column_limit: 256,
+                expression_depth: 100,
+                compound_terms: 50,
+                parameter_limit: 1000,
+            },
+        )
+        .expect("start worker");
+        (dir, worker)
+    }
+
+    fn trusted_begin() -> Job {
+        Box::new(|c: &mut Connection, _ctx| {
+            policy::trusted(|| c.execute_batch("BEGIN")).map_err(WorkerError::Sqlite)?;
+            Ok(serde_json::json!({"begun": true}))
+        })
+    }
+
+    #[tokio::test]
+    async fn run_normal_guard_window() {
+        let _support = SupportGuard::enable();
+        let (_dir, worker) = start_test_worker(60);
+        let job: Job = Box::new(|c: &mut Connection, _ctx: &RequestContext| {
+            policy::trusted(|| c.execute_batch("SELECT 1")).map_err(WorkerError::Sqlite)?;
+            Ok(serde_json::json!({"ok": true}))
+        });
+        worker
+            .run(Duration::from_secs(5), job)
+            .await
+            .expect("run job");
+        assert_arm_window("run", &["request", "cleanup"]);
+        // The request window is installed before the job's first operation.
+        let arm = one_seq(Event::GuardInstalled, "run:arm");
+        let request_install = one_seq(Event::GuardInstalled, "run:request");
+        let request_first = one_seq(Event::FirstSqliteOperation, "run:request");
+        let cleanup_install = one_seq(Event::GuardInstalled, "run:cleanup");
+        let cleanup_first = one_seq(Event::FirstSqliteOperation, "run:cleanup");
+        assert!(arm < request_install);
+        assert!(request_install < request_first);
+        assert!(request_first < cleanup_install);
+        assert!(cleanup_install < cleanup_first);
+        let _ = worker.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn run_idle_expiry_guard_window() {
+        let _support = SupportGuard::enable();
+        let (_dir, worker) = start_test_worker(60);
+        // Open a transaction, then move the injected clock past the idle
+        // deadline so the next Run takes the idle-expiry rollback branch.
+        worker
+            .run(Duration::from_secs(5), trusted_begin())
+            .await
+            .unwrap();
+        test_support::set_clock_ms(61_000);
+        let job: Job = Box::new(|_c: &mut Connection, _ctx: &RequestContext| {
+            Ok(serde_json::json!({"unreachable": true}))
+        });
+        let expired = worker.run(Duration::from_secs(5), job).await;
+        assert!(expired.is_err(), "expired run must fail: {expired:?}");
+        assert_arm_window("run", &["idle-expiry"]);
+        let _ = worker.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn run_client_cancel_cleanup_guard_window() {
+        let _support = SupportGuard::enable();
+        let (_dir, worker) = start_test_worker(60);
+        // The job cancels its own request token and then fails with a SQLite
+        // error, so the post-request client-cancellation cleanup path
+        // converts the outcome to the truthful interruption class.
+        let job: Job = Box::new(|_c: &mut Connection, ctx: &RequestContext| {
+            ctx.token.cancel();
+            Err(WorkerError::Sqlite(rusqlite::Error::InvalidQuery))
+        });
+        let cancelled = worker.run(Duration::from_secs(5), job).await;
+        assert!(
+            cancelled.is_err(),
+            "self-cancelled request must report interruption: {cancelled:?}"
+        );
+        assert_arm_window("run", &["request", "cleanup"]);
+        let _ = worker.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn run_deadline_cleanup_guard_window() {
+        let _support = SupportGuard::enable();
+        let (_dir, worker) = start_test_worker(60);
+        // Deadline expires while the job runs and the job returns a SQLite
+        // error, entering the truthful deadline cleanup path.
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let ctx = RequestContext {
+            token: CancelToken::new(),
+            deadline,
+        };
+        let (rtx, rrx) = oneshot::channel();
+        let job: Job = Box::new(|_c: &mut Connection, _ctx: &RequestContext| {
+            std::thread::sleep(Duration::from_millis(200));
+            Err(WorkerError::Sqlite(rusqlite::Error::InvalidQuery))
+        });
+        worker.tx.send(Command::Run(job, ctx, rtx)).await.unwrap();
+        let outcome = rrx.await.expect("run result");
+        assert!(outcome.is_err(), "deadline run must fail: {outcome:?}");
+        assert_arm_window("run", &["request", "cleanup"]);
+        let _ = worker.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn run_shutdown_cleanup_guard_window() {
+        let _support = SupportGuard::enable();
+        let (_dir, worker) = start_test_worker(60);
+        // Cancel the worker's shutdown token inside the job and return a
+        // SQLite error, entering the shutdown cleanup path.
+        let cancel = worker.cancel.clone();
+        let job: Job = Box::new(move |_c: &mut Connection, _ctx: &RequestContext| {
+            cancel.cancel();
+            Err(WorkerError::Sqlite(rusqlite::Error::InvalidQuery))
+        });
+        let shutdown_run = worker.run(Duration::from_secs(5), job).await;
+        assert!(shutdown_run.is_err(), "shutdown run must fail");
+        assert_arm_window("run", &["request", "cleanup"]);
+        let _ = worker.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn control_and_commit_guard_windows() {
+        let _support = SupportGuard::enable();
+        let (_dir, worker) = start_test_worker(60);
+        // Control normal.
+        let control_job: Job = Box::new(|c: &mut Connection, _ctx: &RequestContext| {
+            policy::trusted(|| c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0)))
+                .map_err(WorkerError::Sqlite)?;
+            Ok(serde_json::json!({"control": true}))
+        });
+        worker.run_control(control_job).await.expect("control job");
+        assert_arm_window("control", &["normal"]);
+        // Commit with no transaction open.
+        let no_tx = worker.run_commit().await.expect("commit outcome");
+        assert!(no_tx.result.is_err());
+        assert_arm_window("commit", &["no-transaction"]);
+        // Open a transaction and expire it so Control takes the expiry branch.
+        worker
+            .run(Duration::from_secs(5), trusted_begin())
+            .await
+            .unwrap();
+        test_support::set_clock_ms(61_000);
+        let unreachable: Job = Box::new(|_c: &mut Connection, _ctx: &RequestContext| {
+            Ok(serde_json::json!({"unreachable": true}))
+        });
+        let expired_control = worker.run_control(unreachable).await;
+        assert!(expired_control.is_err(), "control must observe expiry");
+        assert_arm_window("control", &["normal", "expiry"]);
+        // Commit expiry requires another open transaction on a fresh worker;
+        // its idle deadline is computed from the already-advanced clock, so
+        // advance past it.
+        let (_dir2, worker2) = start_test_worker(60);
+        worker2
+            .run(Duration::from_secs(5), trusted_begin())
+            .await
+            .unwrap();
+        test_support::set_clock_ms(122_000);
+        let expired_commit = worker2.run_commit().await.expect("commit outcome");
+        assert!(expired_commit.result.is_err());
+        assert_arm_window("commit", &["expiry"]);
+        let _ = worker.shutdown().await;
+        let _ = worker2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn expire_and_shutdown_guard_windows() {
+        let _support = SupportGuard::enable();
+        let (_dir, worker) = start_test_worker(60);
+        worker.expire().await.expect("expire result");
+        assert_arm_window("expire", &["normal"]);
+        worker.shutdown().await.expect("clean shutdown");
+        assert_arm_window("shutdown", &["cleanup"]);
+        // After shutdown the busy window is gone; the guard cleared exactly
+        // once per command already asserted by assert_arm_window.
+        let cleared = test_support::retained_records(Event::GuardCleared)
+            .into_iter()
+            .filter(|record| {
+                record
+                    .key
+                    .as_ref()
+                    .and_then(|key| key.worker_id.as_deref())
+                    .is_some_and(|label| label.ends_with(":arm"))
+            })
+            .count();
+        let installed = test_support::retained_records(Event::GuardInstalled)
+            .into_iter()
+            .filter(|record| {
+                record
+                    .key
+                    .as_ref()
+                    .and_then(|key| key.worker_id.as_deref())
+                    .is_some_and(|label| label.ends_with(":arm"))
+            })
+            .count();
+        assert_eq!(
+            cleared, installed,
+            "every installed arm guard must be cleared exactly once"
+        );
+        let _ = Ordering::SeqCst;
     }
 }

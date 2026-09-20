@@ -47,6 +47,10 @@ pub enum Event {
     CreationPostInitCheckpoint,
     // Harness-only: emitted by instrumented children on parent command.
     HarnessCommand,
+    // Bounded busy-window guard lifecycle (worker command arms).
+    GuardInstalled,
+    FirstSqliteOperation,
+    GuardCleared,
 }
 
 pub const ALL_EVENTS: &[Event] = &[
@@ -73,6 +77,9 @@ pub const ALL_EVENTS: &[Event] = &[
     Event::CreationPostOpenCheckpoint,
     Event::CreationPostInitCheckpoint,
     Event::HarnessCommand,
+    Event::GuardInstalled,
+    Event::FirstSqliteOperation,
+    Event::GuardCleared,
 ];
 
 /// Identifies which worker/request or creation operation emitted an event.
@@ -102,14 +109,19 @@ impl EventKey {
     }
 }
 
-/// One retained emission. `seq` is process-wide monotonic; cursors over `seq`
-/// make waits lossless.
+/// One retained emission. `seq` is monotonic within an event kind; `order`
+/// is the process-global emission ordinal and is the only field valid for
+/// comparing emission order across different event kinds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventRecord {
     pub seq: u64,
     pub event: Event,
     pub key: Option<EventKey>,
+    pub order: u64,
 }
+
+/// Process-global emission ordinal shared by all event kinds.
+static GLOBAL_ORDER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 struct ArmedGate {
@@ -297,7 +309,13 @@ fn emit_keyed_always(event: Event, key: Option<EventKey>) {
     let slot = map.entry(event).or_default();
     let seq = slot.next_seq;
     slot.next_seq = seq.saturating_add(1);
-    slot.records.push_back(EventRecord { seq, event, key });
+    let order = GLOBAL_ORDER.fetch_add(1, Ordering::SeqCst);
+    slot.records.push_back(EventRecord {
+        seq,
+        event,
+        key,
+        order,
+    });
     while slot.records.len() > RETAINED_PER_EVENT {
         slot.records.pop_front();
         slot.dropped = slot.dropped.saturating_add(1);
@@ -458,6 +476,20 @@ pub fn count(event: Event) -> usize {
     lock.lock()
         .map(|map| map.get(&event).map(|slot| slot.records.len()).unwrap_or(0))
         .unwrap_or(0)
+}
+
+/// Snapshot of the retained records for `event`, in emission order. Worker
+/// fixtures use this to filter by key label and assert event ordering via
+/// the monotonic `seq`.
+pub fn retained_records(event: Event) -> Vec<EventRecord> {
+    let (lock, _) = registry();
+    lock.lock()
+        .map(|map| {
+            map.get(&event)
+                .map(|slot| slot.records.iter().cloned().collect())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
 }
 
 /// Clear all retained records, arms, and fault injections, and reset the
