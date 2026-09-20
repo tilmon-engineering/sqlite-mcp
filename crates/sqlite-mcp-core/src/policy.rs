@@ -409,8 +409,9 @@ impl<'a> Cursor<'a> {
     }
 
     /// Consume a balanced parenthesized group when the next character opens
-    /// one (view column lists); nested groups and quoted segments are
-    /// consumed whole.
+    /// one (view column lists); nested groups, quoted segments, and
+    /// bracket-quoted identifiers are consumed whole so a `(` inside `[x(]`
+    /// cannot open a phantom group.
     fn skip_parenthesized(&mut self) {
         self.skip_trivia();
         if !self.rest.starts_with('(') {
@@ -440,8 +441,33 @@ impl<'a> Cursor<'a> {
                         }
                     }
                 }
+                '[' => {
+                    for inner in self.rest.chars().by_ref() {
+                        self.rest = &self.rest[inner.len_utf8()..];
+                        if inner == ']' {
+                            break;
+                        }
+                    }
+                }
                 _ => {}
             }
+        }
+    }
+
+    /// Consume a complete schema-qualified object-name component sequence:
+    /// one name component, then, while a `.` follows, the dot and the next
+    /// component. Each component is a quoted identifier (one unit) or one
+    /// plain token, so `main.pragma_view` and `main."x-pragma_y"` are both
+    /// consumed as names rather than scanned as body text.
+    fn skip_object_name(&mut self) {
+        self.skip_quoted_or_token();
+        loop {
+            self.skip_trivia();
+            if !self.rest.starts_with('.') {
+                return;
+            }
+            self.rest = &self.rest['.'.len_utf8()..];
+            self.skip_quoted_or_token();
         }
     }
 }
@@ -530,7 +556,7 @@ pub fn check_stored_body(sql: &str, mutation_seen: &MutationSignal) -> Result<()
         cursor.skip_word_if("if");
         cursor.skip_word_if("not");
         cursor.skip_word_if("exists");
-        cursor.skip_quoted_or_token();
+        cursor.skip_object_name();
         cursor.skip_parenthesized();
         if contains_unquoted_pragma_ref(cursor.rest) {
             return Err(PolicyError::Denied);
@@ -540,29 +566,19 @@ pub fn check_stored_body(sql: &str, mutation_seen: &MutationSignal) -> Result<()
 }
 
 /// True when `text` contains a `pragma_` reference outside quoted
-/// identifiers and string literals. Quoted segments (`"…"`, `` `…` ``,
-/// `[…]`, `'…'`, with doubled-quote escapes) cannot execute a pragma
-/// table-valued function, so their contents are skipped.
+/// identifiers, string literals, and SQL comments. Quoted segments (`"…"`,
+/// `` `…` ``, `[…]`, `'…'`, with doubled-quote escapes) and comment text
+/// cannot execute a pragma table-valued function, so their contents are
+/// skipped.
 fn contains_unquoted_pragma_ref(text: &str) -> bool {
     let mut unquoted = String::new();
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '"' | '`' => {
+            '"' | '`' | '\'' => {
                 while let Some(inner) = chars.next() {
                     if inner == c {
                         if chars.peek() == Some(&c) {
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-            '\'' => {
-                while let Some(inner) = chars.next() {
-                    if inner == '\'' {
-                        if chars.peek() == Some(&'\'') {
                             chars.next();
                         } else {
                             break;
@@ -574,6 +590,27 @@ fn contains_unquoted_pragma_ref(text: &str) -> bool {
                 for inner in chars.by_ref() {
                     if inner == ']' {
                         break;
+                    }
+                }
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                chars.next();
+                for inner in chars.by_ref() {
+                    if inner == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                loop {
+                    match chars.next() {
+                        Some('*') if chars.peek() == Some(&'/') => {
+                            chars.next();
+                            break;
+                        }
+                        Some(_) => {}
+                        None => break,
                     }
                 }
             }
@@ -983,6 +1020,17 @@ mod tests {
             "CREATE VIEW v AS SELECT \"pragma_x\"",
             "CREATE TRIGGER \"t-pragma_x\" AFTER INSERT ON t BEGIN SELECT 1; END",
             "CREATE VIEW IF NOT EXISTS \"a-b-pragma_x\" AS SELECT 1",
+            // Schema-qualified names (R3-3): the qualified name is consumed
+            // as an object name, not scanned as body text.
+            "CREATE VIEW main.pragma_view AS SELECT 1",
+            "CREATE TRIGGER main.pragma_trigger AFTER INSERT ON t BEGIN SELECT 1; END",
+            "CREATE VIEW main.\"x-pragma_view2\" AS SELECT 1",
+            // Comment text cannot execute a pragma reference (R3-2).
+            "CREATE VIEW v_comment AS SELECT 1 /* pragma_table_info */",
+            "CREATE VIEW v_line AS SELECT 1 -- pragma_table_info\n",
+            // A bracket-quoted column list containing parentheses is one
+            // component (R3-1).
+            "CREATE VIEW v([x(]) AS SELECT 1",
         ] {
             assert!(
                 check_stored_body(sql, &signal).is_ok(),
@@ -996,6 +1044,12 @@ mod tests {
             "CREATE VIEW v(x) AS SELECT * FROM pragma_table_info('t')",
             "CREATE TRIGGER g AFTER INSERT ON t BEGIN SELECT * FROM pragma_table_info('t'); END",
             "CREATE TEMP VIEW tv AS SELECT * FROM pragma_table_info('t')",
+            // The R3-1 bypass: a bracket-quoted column list must not hide the
+            // body's pragma reference.
+            "CREATE VIEW v([x(]) AS SELECT * FROM pragma_table_info('t')",
+            // A comment does not neutralize a real reference elsewhere.
+            "CREATE VIEW v2 AS SELECT 1 /* pragma_x */ , (SELECT * FROM pragma_table_info('t'))",
+            "CREATE VIEW v3 AS SELECT 1 -- pragma_x\n, (SELECT * FROM pragma_table_info('t'))",
         ] {
             assert!(
                 check_stored_body(sql, &signal).is_err(),

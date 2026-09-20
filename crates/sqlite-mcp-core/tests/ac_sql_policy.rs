@@ -163,23 +163,55 @@ async fn stored_body_guard_accepts_pragma_named_identifiers() {
     )
     .await
     .expect("quoted trigger name containing pragma_ must be allowed");
+    // Schema-qualified unquoted names containing pragma_ are object names,
+    // not body references (R3-3).
+    core.query(&id, "CREATE VIEW main.pragma_view AS SELECT 1", &[])
+        .await
+        .expect("schema-qualified view name containing pragma_ must be allowed");
+    core.query(
+        &id,
+        "CREATE TRIGGER main.pragma_trigger AFTER INSERT ON t BEGIN SELECT 1; END",
+        &[],
+    )
+    .await
+    .expect("schema-qualified trigger name containing pragma_ must be allowed");
+    // Comment text cannot execute a pragma reference (R3-2).
+    core.query(
+        &id,
+        "CREATE VIEW v_comment AS SELECT 1 /* pragma_table_info */",
+        &[],
+    )
+    .await
+    .expect("block comment containing pragma_ must be allowed");
+    core.query(
+        &id,
+        "CREATE VIEW v_line AS SELECT 1 -- pragma_table_info\n",
+        &[],
+    )
+    .await
+    .expect("line comment containing pragma_ must be allowed");
+    // A bracket-quoted column list with parentheses is one component (R3-1).
+    core.query(&id, "CREATE VIEW v([x(]) AS SELECT 1", &[])
+        .await
+        .expect("bracket-quoted column list must be allowed");
     core.query(&id, "SELECT * FROM \"a-b-pragma_x\"", &[])
         .await
         .expect("the created view is readable");
     // A real unquoted pragma table-valued reference in a stored body is
-    // still rejected.
-    let result = core
-        .query(
-            &id,
-            "CREATE VIEW bad AS SELECT * FROM pragma_table_info('t')",
-            &[],
-        )
-        .await;
-    let err = result.expect_err("pragma reference in stored body must be denied");
-    assert!(
-        err.to_string().contains("denied by SQL policy"),
-        "unexpected denial shape: {err}"
-    );
+    // still rejected — including behind a bracket-quoted column list, which
+    // must not hide the body from the scan (R3-1 bypass).
+    for sql in [
+        "CREATE VIEW bad AS SELECT * FROM pragma_table_info('t')",
+        "CREATE VIEW bad_bracket AS SELECT * FROM pragma_table_info('t') -- x",
+        "CREATE VIEW v([x(]) AS SELECT * FROM pragma_table_info('t')",
+    ] {
+        let result = core.query(&id, sql, &[]).await;
+        let err = result.expect_err("pragma reference in stored body must be denied");
+        assert!(
+            err.to_string().contains("denied by SQL policy"),
+            "unexpected denial shape for {sql}: {err}"
+        );
+    }
     core.rollback(&id).await.unwrap();
     core.shutdown().await;
 }
