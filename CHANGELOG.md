@@ -6,6 +6,8 @@ Provisional first-release notes were finalized from inspected history spanning r
 
 ## [0.2.0] - 2026-09-20
 
+Provisional notes were finalized from inspected history spanning `v0.1.0` through implementation commit `dadf95f` (15 commits); the subsequent notes-only commit is not part of that inspected history.
+
 ### Added
 
 - Git-independent SQLite merge tools: `extract_sqlite_merge` produces deterministic logical SQL schema snapshots plus sidecar observations for three-way comparison, and `import_sqlite_text` replays a validated SQL image into a new database. Both are explicit-path, bounded, never invoke the SQLite CLI, and never overwrite existing inputs or outputs.
