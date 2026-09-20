@@ -85,6 +85,46 @@ async fn successful_dml_does_not_invalidate_observation() {
 }
 
 #[tokio::test]
+async fn ddl_and_select_do_not_inherit_dml_changes() {
+    let _hooks = HOOK_LOCK.lock().await;
+    let (_dir, core, id) = table_setup().await;
+    let insert = core
+        .query(
+            &id,
+            "INSERT INTO t VALUES ('a'),('b'),('c'),('d'),('e')",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(insert.changes, 5, "{insert:?}");
+    let ddl = core
+        .query(&id, "CREATE TABLE ddl_only(x)", &[])
+        .await
+        .unwrap();
+    assert_eq!(ddl.changes, 0, "{ddl:?}");
+    let select = core
+        .query(&id, "SELECT count(*) FROM t", &[])
+        .await
+        .unwrap();
+    assert_eq!(select.changes, 0, "{select:?}");
+    let zero_row = core
+        .query(&id, "UPDATE t SET x = 'a' WHERE x = 'missing'", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        zero_row.changes, 0,
+        "zero-match DML after a 5-row DML must not inherit its count: {zero_row:?}"
+    );
+    let real = core
+        .query(&id, "UPDATE t SET x = 'z' WHERE x in ('a','b','c')", &[])
+        .await
+        .unwrap();
+    assert_eq!(real.changes, 3, "{real:?}");
+    core.rollback(&id).await.unwrap();
+    core.shutdown().await;
+}
+
+#[tokio::test]
 async fn successful_noop_ddl_retains_observation() {
     let _hooks = HOOK_LOCK.lock().await;
     let (_dir, core, _path, id) = setup(Config::default()).await;

@@ -142,6 +142,13 @@ impl Core {
                         let columns = (0..column_count)
                             .map(|i| st.column_name(i).unwrap_or("").to_owned())
                             .collect();
+                        // Snapshot the connection-wide DML counter before
+                        // execution: only statements that actually modified
+                        // rows report a change count, so DDL and SELECT (and
+                        // zero-row DML) report zero instead of inheriting the
+                        // previous statement's count.
+                        let total_changes_before =
+                            unsafe { rusqlite::ffi::sqlite3_total_changes(c.handle()) };
                         let mut rows = st.query(rusqlite::params_from_iter(values.iter()))?;
                         let mut data = Vec::new();
                         let mut truncated = false;
@@ -158,7 +165,13 @@ impl Core {
                             }
                         }
                         drop(rows);
-                        let changes = if st.readonly() { 0 } else { c.changes() };
+                        let total_changes_after =
+                            unsafe { rusqlite::ffi::sqlite3_total_changes(c.handle()) };
+                        let changes = if total_changes_after > total_changes_before {
+                            c.changes()
+                        } else {
+                            0
+                        };
                         Ok(QueryResult {
                             columns,
                             rows_returned: data.len(),

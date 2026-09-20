@@ -63,3 +63,14 @@ fn readme_documents_error_classes() {
         "README must reference DESIGN.md's error-class list"
     );
 }
+
+#[test]
+fn readme_documents_change_counts() {
+    let readme = readme();
+    assert!(
+        readme.contains(
+            "Only DML statements report affected-row counts (`changes`); SELECT/DDL report zero"
+        ),
+        "README must document the per-statement change-count rule"
+    );
+}
