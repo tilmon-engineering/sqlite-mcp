@@ -109,3 +109,56 @@ async fn envelope_state_matrix() {
     );
     fixture.close().await;
 }
+
+#[tokio::test]
+async fn result_too_large_class_reported() {
+    // A result payload exceeding the configured byte cap reports the
+    // RESULT_TOO_LARGE class (not INTERNAL) with a truthful, usable
+    // transaction state.
+    let config = sqlite_mcp_core::Config {
+        result_byte_limit: 512,
+        ..sqlite_mcp_core::Config::default()
+    };
+    let fixture = Fixture::with_config(config).await;
+    let created = fixture
+        .call("create_database", json!({"path": fixture.path}))
+        .await;
+    assert_envelope(&created, false);
+    let opened = fixture
+        .call(
+            "open_database",
+            json!({"path": fixture.path, "readonly": false}),
+        )
+        .await;
+    let id = handle(assert_envelope(&opened, false));
+    fixture.call("get_schema", json!({"handle": id})).await;
+    fixture
+        .call("begin_transaction", json!({"handle": id}))
+        .await;
+    let oversized = fixture
+        .call(
+            "query",
+            json!({
+                "handle": id,
+                "sql": "SELECT randomblob(1024)",
+                "parameters": []
+            }),
+        )
+        .await;
+    let error = assert_envelope(&oversized, true)["error"].clone();
+    assert_eq!(error["class"], "RESULT_TOO_LARGE", "{error}");
+    assert_eq!(error["transaction_open"], true, "{error}");
+    assert_eq!(error["transaction_continuable"], true, "{error}");
+    // The transaction survives truthfully: a subsequent query and rollback
+    // both work.
+    let followup = fixture
+        .call(
+            "query",
+            json!({"handle": id, "sql": "SELECT 1", "parameters": []}),
+        )
+        .await;
+    assert_envelope(&followup, false);
+    let rollback = fixture.call("rollback", json!({"handle": id})).await;
+    assert_envelope(&rollback, false);
+    fixture.close().await;
+}

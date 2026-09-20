@@ -43,7 +43,7 @@ Copy [`config.example.toml`](config.example.toml). Configuration is process-wide
 | `writable_idle_seconds` | `60` | Positive; 1..=86400. Writable transaction idle expiry. |
 | `readonly_idle_seconds` | `600` | Positive; 1..=604800. Read-only transaction idle expiry. |
 | `result_row_limit` | `500` | Positive; 1..=100000. Maximum returned rows. |
-| `result_byte_limit` | `1048576` | Positive; 1..=67108864. Maximum serialized selected result payload (columns+rows) bytes. |
+| `result_byte_limit` | `1048576` | Positive; 1..=67108864. Maximum serialized selected result payload (columns+rows) bytes. `RESULT_TOO_LARGE` is reported when a result exceeds the byte cap. |
 | `schema_byte_limit` | `2097152` | Positive; 1..=67108864. Maximum complete schema payload bytes. |
 | `busy_wait_ms` | `2000` | Positive; 1..=60000. Bounded busy/locked wait in milliseconds. Lock contention waits at most `busy_wait_ms` and then reports `BUSY`. |
 | `sql_byte_limit` | `102400` | Positive; 1..=1048576. Maximum SQL text bytes. |

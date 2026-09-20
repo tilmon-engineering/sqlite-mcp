@@ -50,3 +50,16 @@ fn readme_documents_busy_wait_bound() {
         "README must document the busy_wait_ms bound and BUSY reporting"
     );
 }
+
+#[test]
+fn readme_documents_error_classes() {
+    let readme = readme();
+    assert!(
+        readme.contains("`RESULT_TOO_LARGE` is reported when a result exceeds the byte cap"),
+        "README must document the RESULT_TOO_LARGE error class"
+    );
+    assert!(
+        readme.contains("[`DESIGN.md`](DESIGN.md) for the normative contract"),
+        "README must reference DESIGN.md's error-class list"
+    );
+}

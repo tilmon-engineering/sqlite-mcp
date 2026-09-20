@@ -28,9 +28,15 @@ pub struct Fixture {
 
 impl Fixture {
     pub async fn new() -> Self {
+        Self::with_config(Config::default()).await
+    }
+
+    /// Test-support-only constructor with an explicit configuration (for
+    /// example a small `result_byte_limit`); never MCP/config surface area.
+    pub async fn with_config(config: Config) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app.sqlite").to_str().unwrap().to_owned();
-        let core = Core::new(Config::default()).unwrap();
+        let core = Core::new(config).unwrap();
         let (server_io, client_io) = tokio::io::duplex(64 * 1024);
         let server_core = core.clone();
         let server = tokio::spawn(async move {

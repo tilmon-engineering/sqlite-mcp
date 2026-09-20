@@ -196,6 +196,43 @@ fn ok_with_moves(
     let envelope = json!({"envelope_version":1,"handle_state":handle.map(state),"next_moves":moves.unwrap_or_else(|| next(tool)),"result":result});
     CallToolResult::structured(envelope)
 }
+/// Authoritative registry of every error class the envelope classifier can
+/// emit. DESIGN §8 must document exactly this set; two-way equality (plus
+/// merge-constructor literal membership) is asserted by
+/// `design_class_set_synchronized`.
+pub(crate) const ERROR_CLASSES: &[&str] = &[
+    // Named CoreError classes.
+    "HANDLE_UNKNOWN",
+    "TX_ALREADY_OPEN",
+    "SCHEMA_REQUIRED",
+    "SCHEMA_STALE",
+    "TX_EXPIRED",
+    "DATABASE_ALREADY_OPEN",
+    "SCHEMA_TOO_LARGE",
+    "CANCELLED",
+    "DEADLINE_EXCEEDED",
+    "BUSY",
+    "BUSY_SNAPSHOT",
+    "INVALID_TRANSACTION_MODE",
+    "HANDLE_LIMIT",
+    "INVALID_DATABASE",
+    "SERVER_SHUTDOWN",
+    "RESULT_TOO_LARGE",
+    // Message-derived classes.
+    "NO_TX_OPEN",
+    // Merge registry (one per merge error constructor).
+    "MERGE_INPUT_INVALID",
+    "MERGE_FORMAT_INVALID",
+    "MERGE_POLICY_DENIED",
+    "MERGE_UNREPRESENTABLE_CONTENT",
+    "MERGE_OUTPUT_EXISTS",
+    "MERGE_LIMIT_EXCEEDED",
+    "MERGE_VALIDATION_FAILED",
+    "MERGE_CLEANUP_UNCERTAIN",
+    // Documented fallback, listed exactly once.
+    "INTERNAL",
+];
+
 /// A BUSY commit is classified as the retryable `BUSY` class only when every
 /// observed lifecycle field agrees: the commit was not confirmed, the state
 /// is not uncertain/invalidated, the worker observed the transaction still
@@ -240,6 +277,7 @@ fn error(tool: &str, err: CoreError, handle: Option<&Handle>) -> CallToolResult 
         CoreError::HandleLimitReached => "HANDLE_LIMIT",
         CoreError::InvalidDatabase => "INVALID_DATABASE",
         CoreError::ServerShutdown => "SERVER_SHUTDOWN",
+        CoreError::Worker(crate::worker::WorkerError::ResultTooLarge { .. }) => "RESULT_TOO_LARGE",
         CoreError::Merge(merge) => merge.class,
         CoreError::CommitLifecycle {
             error,
@@ -261,6 +299,10 @@ fn error(tool: &str, err: CoreError, handle: Option<&Handle>) -> CallToolResult 
         _ if err.to_string().to_ascii_lowercase().contains("busy") => "BUSY",
         _ => "INTERNAL",
     };
+    debug_assert!(
+        ERROR_CLASSES.contains(&class),
+        "classifier emitted undocumented error class {class:?} for {err:?}"
+    );
     // Errors that carry authoritative lifecycle state (observed on the
     // worker) take precedence over the cached registry handle metadata.
     let explicit_lifecycle: Option<(bool, bool)> = match &err {
@@ -648,6 +690,72 @@ mod tests {
             rusqlite::ffi::Error::new(code),
             Some(format!("sqlite code {code}")),
         ))
+    }
+
+    fn repository_file(path: &str) -> String {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        std::fs::read_to_string(root.join(path))
+            .unwrap_or_else(|error| panic!("read {path}: {error}"))
+    }
+
+    /// DESIGN §8's enumerated class set and the production `ERROR_CLASSES`
+    /// registry must be equal in both directions: every emitted class is
+    /// documented and no undocumented class is claimed. The class-set
+    /// sentence is delimited by "exact class set is:" and the trailing "An
+    /// interrupt" sentence, and its backtick-quoted tokens are the classes.
+    #[test]
+    fn design_class_set_synchronized() {
+        let design = repository_file("DESIGN.md");
+        let start = design
+            .find("exact class set is:")
+            .expect("DESIGN §8 must contain the class-set sentence");
+        let end = design[start..]
+            .find("An interrupt")
+            .map(|offset| start + offset)
+            .expect("DESIGN §8 class-set sentence must be delimited");
+        let sentence = &design[start..end];
+        let mut documented: std::collections::BTreeSet<&str> = Default::default();
+        let mut rest = sentence;
+        while let Some(open) = rest.find('`') {
+            let after = &rest[open + 1..];
+            let close = after
+                .find('`')
+                .unwrap_or_else(|| panic!("unbalanced backticks in DESIGN class set: {sentence}"));
+            documented.insert(&after[..close]);
+            rest = &after[close + 1..];
+        }
+        let registry: std::collections::BTreeSet<&str> = ERROR_CLASSES.iter().copied().collect();
+        assert_eq!(
+            registry, documented,
+            "DESIGN §8 class set and ERROR_CLASSES registry disagree"
+        );
+        assert_eq!(
+            registry.len(),
+            ERROR_CLASSES.len(),
+            "ERROR_CLASSES must not duplicate an entry"
+        );
+        // Secondary check: every merge constructor's class literal in the
+        // merge source is a registry member, and every registry MERGE_* class
+        // is constructed there.
+        let merge_source = repository_file("crates/sqlite-mcp-core/src/merge.rs");
+        let mut constructed: std::collections::BTreeSet<&str> = Default::default();
+        for token in merge_source.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            if token.starts_with("MERGE_") {
+                constructed.insert(token);
+            }
+        }
+        for class in registry.iter().filter(|c| c.starts_with("MERGE_")) {
+            assert!(
+                constructed.contains(class),
+                "registry merge class {class} is never constructed in merge.rs"
+            );
+        }
+        for token in &constructed {
+            assert!(
+                registry.contains(token),
+                "merge.rs constructs undocumented class {token}"
+            );
+        }
     }
 
     #[test]
