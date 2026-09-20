@@ -127,6 +127,9 @@ impl Core {
                     crate::policy::check_stored_body(&statement, &mutation_signal).map_err(
                         |e| WorkerError::Message(format!("statement is denied by SQL policy: {e}")),
                     )?;
+                    crate::policy::check_maintenance(&statement).map_err(|e| {
+                        WorkerError::Message(format!("statement is denied by SQL policy: {e}"))
+                    })?;
                     crate::policy::trusted(|| c.execute_batch("SAVEPOINT agent_stmt"))?;
                     let result = (|| {
                         let mut st = c.prepare(&statement)?;

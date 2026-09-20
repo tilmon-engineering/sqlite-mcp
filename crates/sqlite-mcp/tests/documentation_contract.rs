@@ -20,3 +20,24 @@ fn readme_documents_sigint_exit() {
         "README must document SIGINT ordered shutdown and exit-zero behavior"
     );
 }
+
+#[test]
+fn readme_documents_temp_schema_denial() {
+    let readme = readme();
+    assert!(
+        readme
+            .contains("Schema-qualified `temp.` objects (e.g. `CREATE TABLE temp.t`) are denied like TEMP objects"),
+        "README must document temp-schema-qualified object denial"
+    );
+}
+
+#[test]
+fn readme_documents_maintenance_denial() {
+    let readme = readme();
+    assert!(
+        readme.contains(
+            "Maintenance operations (`ANALYZE`, `REINDEX`) and extension loading are denied"
+        ),
+        "README must document maintenance and extension-loading denial"
+    );
+}

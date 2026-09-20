@@ -61,6 +61,71 @@ async fn sql_policy_escape_matrix() {
 }
 
 #[tokio::test]
+async fn schema_qualified_temp_objects_denied() {
+    let (_dir, core, _path, id) = setup().await;
+    for sql in [
+        "CREATE TABLE temp.t2(a)",
+        "CREATE VIEW temp.v AS SELECT 1",
+        // `CREATE INDEX temp.i` never reaches the authorizer: SQLite
+        // structurally rejects a TEMP index on a non-TEMP table. The
+        // authorizer-level temp denial for CreateIndex is pinned by the
+        // policy unit decision table.
+        "CREATE INDEX temp.i ON t(a)",
+    ] {
+        let err = core
+            .query(&id, sql, &[])
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("temp-schema create accepted: {sql}"));
+        assert!(
+            err.to_string().contains("not authorized")
+                || err.to_string().to_lowercase().contains("temp index"),
+            "expected denial for {sql}, got: {err}"
+        );
+    }
+    // Controls: unqualified and `main.`-qualified creates succeed on the
+    // writable handle.
+    core.query(&id, "CREATE TABLE plain_t2(a)", &[])
+        .await
+        .expect("unqualified create");
+    core.query(&id, "CREATE TABLE main.t2(a)", &[])
+        .await
+        .expect("main-qualified create");
+    core.query(&id, "CREATE INDEX main.i ON t(a)", &[])
+        .await
+        .expect("main-qualified index");
+    core.rollback(&id).await.unwrap();
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn analyze_and_reindex_denied() {
+    let (_dir, core, _path, id) = setup().await;
+    // REINDEX only fires the authorizer when an index exists to reindex.
+    core.query(&id, "CREATE INDEX i ON t(a)", &[])
+        .await
+        .expect("setup index");
+    for sql in ["ANALYZE", "REINDEX main.t", "REINDEX"] {
+        let err = core
+            .query(&id, sql, &[])
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("maintenance operation accepted: {sql}"));
+        assert!(
+            err.to_string().contains("maintenance operations"),
+            "expected maintenance policy denial for {sql}, got: {err}"
+        );
+    }
+    // No effect: the ordinary read path still works and the transaction
+    // remains usable.
+    core.query(&id, "SELECT count(*) FROM t", &[])
+        .await
+        .expect("read after denied maintenance");
+    core.rollback(&id).await.unwrap();
+    core.shutdown().await;
+}
+
+#[tokio::test]
 async fn parameter_validation_and_schema_recheck() {
     let (_dir, core, _path, id) = setup().await;
     assert!(
