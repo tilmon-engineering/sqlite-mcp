@@ -6,7 +6,7 @@ Provisional first-release notes were finalized from inspected history spanning r
 
 ## [0.3.0] - 2026-09-22
 
-Provisional notes summarize the reviewed working-tree implementation relative to published `v0.2.0`; they will be finalized from the implementation commit before tagging.
+Notes were finalized from inspected history spanning published `v0.2.0` through implementation commit `3c981a7` (1 commit); this subsequent notes-only commit is not part of that inspected history.
 
 ### Added
 
