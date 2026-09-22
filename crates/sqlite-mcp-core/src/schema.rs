@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaInfo {
     pub schema_version: i64,
+    pub user_version: i64,
     pub identity: String,
     pub objects: Vec<SchemaObject>,
     pub tables: Vec<SchemaTable>,
@@ -19,6 +20,9 @@ pub struct SchemaTable {
 pub struct SchemaColumn {
     pub name: String,
     pub declared_type: Option<String>,
+    pub not_null: bool,
+    pub default_value: Option<String>,
+    pub primary_key_position: i64,
     pub hidden: i64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,9 +34,14 @@ pub struct SchemaIndex {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaForeignKey {
+    pub id: i64,
+    pub sequence: i64,
     pub table: String,
     pub from: String,
     pub to: String,
+    pub on_update: String,
+    pub on_delete: String,
+    pub match_clause: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaObject {

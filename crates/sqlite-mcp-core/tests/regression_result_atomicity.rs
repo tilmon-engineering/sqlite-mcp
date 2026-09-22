@@ -1,13 +1,9 @@
 use base64::Engine;
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use sqlite_mcp_core::test_support::TEST_HOOK_LOCK as FAULT_LOCK;
 use sqlite_mcp_core::{Cell, Config, Core, CoreError};
 use tempfile::{TempDir, tempdir};
-
-/// Serializes tests that touch the savepoint boundary: the cleanup-fault
-/// registry is process-global, so parallel tests could steal each other's
-/// injected faults.
-static FAULT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn fixture(config: Config) -> (TempDir, Core, String, String) {
     unsafe { std::env::set_var("SQLITE_MCP_TEST_SUPPORT", "1") };

@@ -1,22 +1,12 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::OnceLock,
     time::Duration,
 };
 
 use rusqlite::Connection;
 use sqlite_mcp_core::{Config, Core};
 use tempfile::{TempDir, tempdir};
-
-static TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-
-async fn test_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    TEST_LOCK
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await
-}
 
 #[derive(Clone, Copy, Debug)]
 enum Checkpoint {
@@ -52,7 +42,7 @@ fn valid_sentinel(path: &Path) -> Vec<u8> {
 }
 
 async fn replacement_at(checkpoint: Checkpoint) -> Vec<String> {
-    let _guard = test_lock().await;
+    let _guard = sqlite_mcp_core::test_support::TEST_HOOK_LOCK.lock().await;
     // The focused RED command enables this marker; setting it here also makes
     // the test self-describing when run directly with cargo test.
     // SAFETY: this focused integration target serializes all hook-using tests.
@@ -164,7 +154,7 @@ fn create_identity_residual_contract() {
 
 #[tokio::test]
 async fn exclusive_create_race_strengthened_contract() {
-    let _guard = test_lock().await;
+    let _guard = sqlite_mcp_core::test_support::TEST_HOOK_LOCK.lock().await;
     let dir: TempDir = tempdir().expect("temporary directory");
     let path: PathBuf = dir.path().join("race.sqlite");
     let core = Core::new(Config::default()).expect("core");

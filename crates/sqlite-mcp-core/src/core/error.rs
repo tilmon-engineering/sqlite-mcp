@@ -71,6 +71,11 @@ pub enum CoreError {
         transaction_open: bool,
         transaction_continuable: bool,
     },
+    #[error("statement is denied by SQL policy")]
+    PolicyDenied {
+        transaction_open: bool,
+        transaction_continuable: bool,
+    },
     #[error("commit lifecycle failure: {error}")]
     CommitLifecycle {
         error: Box<WorkerError>,
@@ -86,6 +91,16 @@ pub enum CoreError {
 pub(crate) fn classify_worker_error(error: WorkerError, transaction_open: bool) -> CoreError {
     if error.to_string().contains("TRANSACTION_EXPIRED") {
         return CoreError::TransactionExpired;
+    }
+    if let WorkerError::PolicyDenied {
+        transaction_open,
+        transaction_continuable,
+    } = error
+    {
+        return CoreError::PolicyDenied {
+            transaction_open,
+            transaction_continuable,
+        };
     }
     if let WorkerError::Sqlite(ref e) = error {
         let extended = e.sqlite_extended_error_code().unwrap_or(-1);

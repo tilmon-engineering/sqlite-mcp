@@ -1425,6 +1425,14 @@ mod tests {
         }
         assert!(validate_repository(&dir, "v0.1.0").is_err());
     }
+    fn workspace_version(root: &Path) -> Result<String, String> {
+        let text = fs::read_to_string(root.join("Cargo.toml"))
+            .map_err(|e| format!("read root Cargo.toml: {e}"))?;
+        let manifest: RootManifest =
+            toml::from_str(&text).map_err(|e| format!("parse root Cargo.toml: {e}"))?;
+        Ok(manifest.workspace.package.version)
+    }
+
     fn tempfile_dir() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -2175,32 +2183,38 @@ mod tests {
             .unwrap();
         let evidence = tempfile_dir().join("evidence.json");
         let sha = "0123456789abcdef0123456789abcdef01234567";
+        let version = workspace_version(&root).unwrap();
+        let tag = format!("v{version}");
         let mut fake = FakeRunner {
-            public_responses: public_fixture(&root, "v0.2.0", sha),
+            public_responses: public_fixture(&root, &tag, sha),
             ..Default::default()
         };
-        verify_public_release(&mut fake, &root, "v0.2.0", sha, &evidence).unwrap();
+        verify_public_release(&mut fake, &root, &tag, sha, &evidence).unwrap();
         let value: serde_json::Value =
             serde_json::from_slice(&fs::read(evidence).unwrap()).unwrap();
-        assert_eq!(value["tag"], "v0.2.0");
+        assert_eq!(value["tag"], tag);
         assert_eq!(value["expected_sha"], sha);
         assert_eq!(
             value["release_url"],
-            "https://github.com/tilmon-engineering/sqlite-mcp/releases/tag/v0.2.0"
+            format!("https://github.com/{PUBLIC_REPO}/releases/tag/{tag}")
         );
         let urls = value["asset_urls"].as_array().unwrap();
         assert_eq!(urls.len(), release_names().len());
         for (url, name) in urls.iter().zip(release_names()) {
             assert_eq!(
                 url,
-                &format!("https://github.com/{PUBLIC_REPO}/releases/download/v0.2.0/{name}")
+                &format!("https://github.com/{PUBLIC_REPO}/releases/download/{tag}/{name}")
             );
         }
         let assertions = value["assertions"].as_array().unwrap();
         assert!(assertions.iter().any(|v| v == "release metadata"));
         assert!(assertions.iter().any(|v| v == "annotated tag peel"));
         assert!(assertions.iter().any(|v| v == "exact assets"));
-        assert!(assertions.iter().any(|v| v == "workspace version 0.2.0"));
+        assert!(
+            assertions
+                .iter()
+                .any(|v| v == &format!("workspace version {version}"))
+        );
     }
 
     #[test]
@@ -2213,7 +2227,8 @@ mod tests {
             .unwrap();
         let evidence = tempfile_dir().join("evidence.json");
         let sha = "0123456789abcdef0123456789abcdef01234567";
-        let mut responses = public_fixture(&root, "v0.2.0", sha);
+        let tag = format!("v{}", workspace_version(&root).unwrap());
+        let mut responses = public_fixture(&root, &tag, sha);
         let mut release: serde_json::Value = serde_json::from_str(&responses[0]).unwrap();
         let body = release["body"].as_str().unwrap().to_owned();
         release["body"] = serde_json::json!(format!("{body}\n"));
@@ -2222,7 +2237,7 @@ mod tests {
             public_responses: responses,
             ..Default::default()
         };
-        verify_public_release(&mut fake, &root, "v0.2.0", sha, &evidence).unwrap();
+        verify_public_release(&mut fake, &root, &tag, sha, &evidence).unwrap();
         assert!(evidence.exists());
     }
 
@@ -2233,6 +2248,7 @@ mod tests {
             .canonicalize()
             .unwrap();
         let sha = "0123456789abcdef0123456789abcdef01234567";
+        let tag = format!("v{}", workspace_version(&root).unwrap());
         let cases = [
             "wrong_sha",
             "wrong_tag_name",
@@ -2254,16 +2270,16 @@ mod tests {
             "malformed",
         ];
         for case in cases {
-            let mut responses = public_fixture(&root, "v0.2.0", sha);
+            let mut responses = public_fixture(&root, &tag, sha);
             let mut release: serde_json::Value = serde_json::from_str(&responses[0]).unwrap();
             match case {
-                "wrong_sha" => responses[2] = serde_json::json!({"tag":"v0.2.0","object":{"sha":"ffffffffffffffffffffffffffffffffffffffff","type":"commit"}}).to_string(),
+                "wrong_sha" => responses[2] = serde_json::json!({"tag":tag,"object":{"sha":"ffffffffffffffffffffffffffffffffffffffff","type":"commit"}}).to_string(),
                 "wrong_tag_name" => responses[2] = serde_json::json!({"tag":"v9.9.9","object":{"sha":sha,"type":"commit"}}).to_string(),
                 "missing_tag_name" => responses[2] = serde_json::json!({"object":{"sha":sha,"type":"commit"}}).to_string(),
                 "wrong_tag_object_type" => responses[2] = serde_json::json!({"tag":"v1.0.0","object":{"sha":sha,"type":"tree"}}).to_string(),
                 "wrong_tag_object_sha" => responses[1] = serde_json::json!({"object":{"type":"tag"}}).to_string(),
                 "missing_release_body" => { release.as_object_mut().unwrap().remove("body"); },
-                "missing_annotated_object" => responses[2] = serde_json::json!({"tag":"v0.2.0"}).to_string(),
+                "missing_annotated_object" => responses[2] = serde_json::json!({"tag":tag}).to_string(),
                 "lightweight" => responses[1] = serde_json::json!({"object":{"sha":sha,"type":"commit"}}).to_string(),
                 "tag_name" => release["tag_name"] = serde_json::json!("v9.9.9"),
                 "body" => release["body"] = serde_json::json!("wrong"),
@@ -2286,7 +2302,7 @@ mod tests {
                 ..Default::default()
             };
             assert!(
-                verify_public_release(&mut fake, &root, "v0.2.0", sha, &evidence).is_err(),
+                verify_public_release(&mut fake, &root, &tag, sha, &evidence).is_err(),
                 "accepted {case}"
             );
             assert!(!evidence.exists(), "wrote evidence for {case}");
@@ -2301,16 +2317,23 @@ mod tests {
             .unwrap();
         let evidence = tempfile_dir().join("must-not-exist.json");
         let sha = "0123456789abcdef0123456789abcdef01234567";
+        let tag = format!("v{}", workspace_version(&root).unwrap());
         let mut fake = FakeRunner {
             public_http_failure: true,
             ..Default::default()
         };
-        assert!(verify_public_release(&mut fake, &root, "v0.2.0", sha, &evidence).is_err());
+        assert!(verify_public_release(&mut fake, &root, &tag, sha, &evidence).is_err());
+        assert!(fake.calls.iter().any(|(program, _)| program == "curl"));
         assert!(!evidence.exists());
     }
 
     #[test]
     fn fetch_public_assets_exact_inventory() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let tag = format!("v{}", workspace_version(&repo_root).unwrap());
         let root = tempfile_dir();
         let dir = root.join("assets");
         let payloads: Vec<Vec<u8>> = archive_names()
@@ -2333,20 +2356,25 @@ mod tests {
             bodies,
             ..Default::default()
         };
-        let assets = fetch_public_assets(&mut fake, "v0.2.0", &dir).unwrap();
+        let assets = fetch_public_assets(&mut fake, &tag, &dir).unwrap();
         assert_eq!(assets.len(), archive_names().len());
         assert_eq!(fs::read_dir(dir).unwrap().count(), release_names().len());
     }
 
     #[test]
     fn fetch_public_assets_failure_no_success() {
-        let root = tempfile_dir();
-        let dir = root.join("assets");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let tag = format!("v{}", workspace_version(&root).unwrap());
+        let dir = tempfile_dir().join("assets");
         let mut fake = HttpFake {
             statuses: vec!["500".into()],
             ..Default::default()
         };
-        assert!(fetch_public_assets(&mut fake, "v0.2.0", &dir).is_err());
+        assert!(fetch_public_assets(&mut fake, &tag, &dir).is_err());
+        assert!(!fake.calls.is_empty());
         assert!(!dir.exists());
     }
 

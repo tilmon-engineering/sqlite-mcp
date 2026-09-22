@@ -37,114 +37,143 @@ impl Core {
                     if managed {
                         crate::policy::trusted(|| c.execute_batch("BEGIN DEFERRED"))?;
                     }
-                    let result = crate::policy::trusted(|| {
-                        // Establish the SQLite read snapshot before consulting the
-                        // schema cookie; PRAGMA schema_version alone is not a
-                        // snapshot-establishing table read on all SQLite builds.
-                        let _: i64 =
-                            c.query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))?;
-                        let version: i64 =
-                            c.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
-                        test_support::emit(test_support::Event::SchemaVersionRead);
-                        let identity = c.path().unwrap_or("").to_string();
-                        let mut st = c.prepare(
-                            "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY name",
-                        )?;
-                        let rows = st.query_map([], |r| {
-                            Ok(SchemaObject {
-                                object_type: r.get(0)?,
-                                name: r.get(1)?,
-                                table_name: r.get(2)?,
-                                sql: r.get(3)?,
-                            })
-                        })?;
-                        let objects = rows.collect::<Result<Vec<_>, _>>()?;
-                        let mut tables = Vec::new();
-                        let mut tl = c.prepare("PRAGMA table_list")?;
-                        let table_rows = tl.query_map([], |r| {
-                            Ok((
-                                r.get::<_, String>(1)?,
-                                r.get::<_, i64>(4)?,
-                                r.get::<_, i64>(5)?,
-                            ))
-                        })?;
-                        for tr in table_rows {
-                            let (name, wr, strict) = tr?;
-                            let mut columns = Vec::new();
-                            let mut x = c.prepare(&format!(
-                                "PRAGMA table_xinfo('{}')",
-                                name.replace("'", "''")
-                            ))?;
-                            for r in x.query_map([], |r| {
-                                Ok(SchemaColumn {
+                    let result: Result<serde_json::Value, WorkerError> =
+                        crate::policy::trusted(|| {
+                            // Establish the SQLite read snapshot before consulting the
+                            // schema cookie; PRAGMA schema_version alone is not a
+                            // snapshot-establishing table read on all SQLite builds.
+                            let _: i64 =
+                                c.query_row("SELECT count(*) FROM sqlite_schema", [], |r| {
+                                    r.get(0)
+                                })?;
+                            let version: i64 =
+                                c.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
+                            let user_version: i64 = {
+                                let mut statement = c.prepare("PRAGMA user_version")?;
+                                if statement.column_count() != 1 {
+                                    return Err(WorkerError::Sqlite(rusqlite::Error::InvalidQuery));
+                                }
+                                let mut rows = statement.query([])?;
+                                let Some(row) = rows.next()? else {
+                                    return Err(WorkerError::Sqlite(
+                                        rusqlite::Error::QueryReturnedNoRows,
+                                    ));
+                                };
+                                let value = row.get::<_, i64>(0)?;
+                                if rows.next()?.is_some() {
+                                    return Err(WorkerError::Sqlite(rusqlite::Error::InvalidQuery));
+                                }
+                                value
+                            };
+                            test_support::emit(test_support::Event::SchemaVersionRead);
+                            let identity = c.path().unwrap_or("").to_string();
+                            let mut st = c.prepare(
+                                "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY name",
+                            )?;
+                            let rows = st.query_map([], |r| {
+                                Ok(SchemaObject {
+                                    object_type: r.get(0)?,
                                     name: r.get(1)?,
-                                    declared_type: r.get(2)?,
-                                    hidden: r.get(6)?,
+                                    table_name: r.get(2)?,
+                                    sql: r.get(3)?,
                                 })
-                            })? {
-                                columns.push(r?);
-                            }
-                            let mut indexes = Vec::new();
-                            let mut il = c.prepare(&format!(
-                                "PRAGMA index_list('{}')",
-                                name.replace("'", "''")
-                            ))?;
-                            for r in il.query_map([], |r| {
+                            })?;
+                            let objects = rows.collect::<Result<Vec<_>, _>>()?;
+                            let mut tables = Vec::new();
+                            let mut tl = c.prepare("PRAGMA table_list")?;
+                            let table_rows = tl.query_map([], |r| {
                                 Ok((
                                     r.get::<_, String>(1)?,
-                                    r.get::<_, i64>(2)?,
-                                    r.get::<_, String>(3)?,
+                                    r.get::<_, i64>(4)?,
+                                    r.get::<_, i64>(5)?,
                                 ))
-                            })? {
-                                let (iname, unique, origin) = r?;
-                                let mut cols = Vec::new();
-                                let mut ix = c.prepare(&format!(
-                                    "PRAGMA index_xinfo('{}')",
-                                    iname.replace("'", "''")
+                            })?;
+                            for tr in table_rows {
+                                let (name, wr, strict) = tr?;
+                                let mut columns = Vec::new();
+                                let mut x = c.prepare(&format!(
+                                    "PRAGMA table_xinfo('{}')",
+                                    name.replace("'", "''")
                                 ))?;
-                                for q in ix.query_map([], |q| q.get::<_, Option<String>>(2))? {
-                                    if let Some(v) = q? {
-                                        cols.push(v);
-                                    }
+                                for r in x.query_map([], |r| {
+                                    Ok(SchemaColumn {
+                                        name: r.get(1)?,
+                                        declared_type: r.get(2)?,
+                                        not_null: r.get::<_, i64>(3)? != 0,
+                                        default_value: r.get(4)?,
+                                        primary_key_position: r.get(5)?,
+                                        hidden: r.get(6)?,
+                                    })
+                                })? {
+                                    columns.push(r?);
                                 }
-                                indexes.push(SchemaIndex {
-                                    name: iname,
-                                    unique: unique != 0,
-                                    origin,
-                                    columns: cols,
+                                let mut indexes = Vec::new();
+                                let mut il = c.prepare(&format!(
+                                    "PRAGMA index_list('{}')",
+                                    name.replace("'", "''")
+                                ))?;
+                                for r in il.query_map([], |r| {
+                                    Ok((
+                                        r.get::<_, String>(1)?,
+                                        r.get::<_, i64>(2)?,
+                                        r.get::<_, String>(3)?,
+                                    ))
+                                })? {
+                                    let (iname, unique, origin) = r?;
+                                    let mut cols = Vec::new();
+                                    let mut ix = c.prepare(&format!(
+                                        "PRAGMA index_xinfo('{}')",
+                                        iname.replace("'", "''")
+                                    ))?;
+                                    for q in ix.query_map([], |q| q.get::<_, Option<String>>(2))? {
+                                        if let Some(v) = q? {
+                                            cols.push(v);
+                                        }
+                                    }
+                                    indexes.push(SchemaIndex {
+                                        name: iname,
+                                        unique: unique != 0,
+                                        origin,
+                                        columns: cols,
+                                    });
+                                }
+                                let mut foreign_keys = Vec::new();
+                                let mut fk = c.prepare(&format!(
+                                    "PRAGMA foreign_key_list('{}')",
+                                    name.replace("'", "''")
+                                ))?;
+                                for r in fk.query_map([], |r| {
+                                    Ok(SchemaForeignKey {
+                                        id: r.get(0)?,
+                                        sequence: r.get(1)?,
+                                        table: r.get(2)?,
+                                        from: r.get(3)?,
+                                        to: r.get(4)?,
+                                        on_update: r.get(5)?,
+                                        on_delete: r.get(6)?,
+                                        match_clause: r.get(7)?,
+                                    })
+                                })? {
+                                    foreign_keys.push(r?);
+                                }
+                                tables.push(SchemaTable {
+                                    name,
+                                    strict: strict != 0,
+                                    without_rowid: wr != 0,
+                                    columns,
+                                    indexes,
+                                    foreign_keys,
                                 });
                             }
-                            let mut foreign_keys = Vec::new();
-                            let mut fk = c.prepare(&format!(
-                                "PRAGMA foreign_key_list('{}')",
-                                name.replace("'", "''")
-                            ))?;
-                            for r in fk.query_map([], |r| {
-                                Ok(SchemaForeignKey {
-                                    table: r.get(2)?,
-                                    from: r.get(3)?,
-                                    to: r.get(4)?,
-                                })
-                            })? {
-                                foreign_keys.push(r?);
-                            }
-                            tables.push(SchemaTable {
-                                name,
-                                strict: strict != 0,
-                                without_rowid: wr != 0,
-                                columns,
-                                indexes,
-                                foreign_keys,
-                            });
-                        }
-                        Ok(serde_json::to_value(SchemaInfo {
-                            schema_version: version,
-                            identity,
-                            objects,
-                            tables,
-                        })
-                        .unwrap())
-                    });
+                            Ok(serde_json::to_value(SchemaInfo {
+                                schema_version: version,
+                                user_version,
+                                identity,
+                                objects,
+                                tables,
+                            })
+                            .unwrap())
+                        });
                     if managed {
                         match result {
                             Ok(value) => {

@@ -8,7 +8,7 @@
 mcp_servers:
   sqlite-mcp:
     transport: stdio
-    command: /var/home/edwards/Projects/sqlite-mcp/target/release/sqlite-mcp
+    command: /home/edwards/.local/share/sqlite-mcp/0.2.0/sqlite-mcp
     # Diagnostics only: the server writes logs to stderr and keeps stdout
     # strictly for MCP protocol bytes, so stdout logging stays off.
     log_stderr: true

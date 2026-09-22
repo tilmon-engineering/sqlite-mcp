@@ -588,14 +588,17 @@ pub(crate) fn take_commit_fault() -> Option<CommitFault> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn keyed_records_are_retained_and_match() {
+    #[tokio::test]
+    async fn keyed_records_are_retained_and_match() {
+        let _hooks = TEST_HOOK_LOCK.lock().await;
+        reset_registry();
         let key = EventKey::operation(7).with_generation(1);
         // arm → emit (blocked) → observe → release.
         let barrier = arm_keyed(Event::HarnessCommand, Some(key.clone()));
+        let emitted_key = key.clone();
         let emitter =
-            std::thread::spawn(move || emit_keyed_always(Event::HarnessCommand, Some(key)));
-        let record = wait_for(Event::HarnessCommand, Duration::from_secs(2)).unwrap();
+            std::thread::spawn(move || emit_keyed_always(Event::HarnessCommand, Some(emitted_key)));
+        let record = wait_keyed(Event::HarnessCommand, Some(&key), Duration::from_secs(2)).unwrap();
         assert_eq!(record.key.as_ref().unwrap().operation_id, 7);
         assert_eq!(record.key.as_ref().unwrap().generation, 1);
         assert!(record.key.as_ref().unwrap().worker_id.is_none());
@@ -603,19 +606,22 @@ mod tests {
         emitter.join().unwrap();
     }
 
-    #[test]
-    fn waits_are_bounded_and_keyed() {
+    #[tokio::test]
+    async fn waits_are_bounded_and_keyed() {
+        let _hooks = TEST_HOOK_LOCK.lock().await;
+        reset_registry();
+        let event = Event::CreationDescriptorCaptured;
         let start = Instant::now();
-        let key = EventKey::operation(99);
-        assert!(wait_keyed(Event::HarnessCommand, Some(&key), Duration::from_millis(50)).is_err());
+        let missing_key = EventKey::operation(99);
+        assert!(wait_keyed(event, Some(&missing_key), Duration::from_millis(50)).is_err());
         assert!(start.elapsed() >= Duration::from_millis(50));
         assert!(start.elapsed() < Duration::from_secs(2));
         // A different key must not satisfy this wait.
-        let barrier = arm_keyed(Event::HarnessCommand, Some(EventKey::operation(100)));
-        let emitter = std::thread::spawn(|| {
-            emit_keyed_always(Event::HarnessCommand, Some(EventKey::operation(101)))
-        });
-        let record = wait_for(Event::HarnessCommand, Duration::from_millis(300)).unwrap();
+        let barrier = arm_keyed(event, Some(EventKey::operation(100)));
+        let emitted_key = EventKey::operation(101);
+        let expected_key = emitted_key.clone();
+        let emitter = std::thread::spawn(move || emit_keyed_always(event, Some(emitted_key)));
+        let record = wait_keyed(event, Some(&expected_key), Duration::from_millis(300)).unwrap();
         assert_eq!(record.key.as_ref().unwrap().operation_id, 101);
         assert_ne!(record.key.as_ref().unwrap().operation_id, 100);
         barrier.release();

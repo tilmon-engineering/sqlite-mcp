@@ -4,6 +4,25 @@ All notable changes are documented here from observed repository history. Releas
 
 Provisional first-release notes were finalized from inspected history spanning root commit `2684862` through implementation commit `e9544c5`; the subsequent notes-only commits are not part of that inspected history.
 
+## [0.3.0] - 2026-09-22
+
+Provisional notes summarize the reviewed working-tree implementation relative to published `v0.2.0`; they will be finalized from the implementation commit before tagging.
+
+### Added
+
+- Direct, read-only query support for exactly `PRAGMA foreign_keys` and `PRAGMA recursive_triggers`, with both connection invariants established and read back before writable, reopened, or read-only workers are published.
+- Trusted `get_schema.user_version` metadata alongside the distinct schema-cookie `schema_version`, including richer deterministic column, index, and foreign-key metadata for compatibility inspection.
+
+### Fixed
+
+- Intentional SQL-policy rejections now report the typed `POLICY_DENIED` class with truthful worker-observed transaction state across authorizer, stored-body, maintenance, and pre-execution guards, while malformed SQL and unrelated SQLite failures retain their native classes.
+- The worker now installs one bounded busy handler, synchronously reports startup readiness, and fails without publishing a handle when connection initialization cannot establish the required invariants.
+- PRAGMA source classification, statement-boundary handling, stored-body protection, and merge's independent blanket PRAGMA denial are covered by expanded regression tests and synchronized documentation.
+
+### Platform notes
+
+- Platform support and artifact properties are unchanged from 0.2.0: Linux GNU builds use Ubuntu 24.04 and its glibc environment (not musl/static); macOS binaries are unsigned and unnotarized and target macOS 15 runners.
+
 ## [0.2.0] - 2026-09-20
 
 Provisional notes were finalized from inspected history spanning `v0.1.0` through implementation commit `dadf95f` (15 commits); the subsequent notes-only commit is not part of that inspected history.

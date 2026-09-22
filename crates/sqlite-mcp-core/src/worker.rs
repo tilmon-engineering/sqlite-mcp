@@ -186,6 +186,16 @@ pub enum WorkerError {
     Message(String),
     #[error("result too large: retained {retained_bytes} bytes exceeds limit {limit}")]
     ResultTooLarge { retained_bytes: usize, limit: usize },
+    #[error("policy denied")]
+    PolicyDenied {
+        transaction_open: bool,
+        transaction_continuable: bool,
+    },
+    #[error("worker startup failed at {stage}: {message}")]
+    Startup {
+        stage: &'static str,
+        message: String,
+    },
     /// The request was interrupted. `by_client` distinguishes an explicit
     /// client cancellation from a query-deadline expiry so callers can
     /// report the truthful outcome class.
@@ -301,6 +311,7 @@ impl Worker {
         limits: WorkerLimits,
     ) -> Result<Self, WorkerError> {
         let (tx, mut rx) = mpsc::channel(capacity);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let cancel = CancelToken::new();
         let mutation_seen = crate::policy::MutationFlag::new();
         let thread_flag = mutation_seen.clone();
@@ -311,46 +322,96 @@ impl Worker {
             .name("sqlite-mcp-worker".into())
             .spawn(move || {
                 SHUTDOWN_TOKEN.with(|slot| *slot.borrow_mut() = Some(thread_cancel.clone()));
-                let mut conn = Connection::open_with_flags(
+                let opened = Connection::open_with_flags(
                     &path,
                     if readonly {
                         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                     } else {
                         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                     },
-                )
-                .ok();
-                if let Some(conn) = conn.as_mut() {
-                    let mut expired = false;
-                    let mut idle_deadline =
-                        test_support::now_ms().saturating_add(idle_seconds.saturating_mul(1000));
-                    let _ = policy::install_authorizer(
-                        conn,
-                        readonly,
-                        thread_flag.clone(),
-                    );
-                    let _ = policy::trusted(|| conn.pragma_update(None, "foreign_keys", true));
-                    let _ = conn.busy_timeout(Duration::from_millis(busy_wait_ms));
-                    // The bounded busy handler is installed once for the
-                    // worker lifetime; per-request windows are managed by
-                    // BusyGuard in each command arm. With no window active a
-                    // lock conflict surfaces SQLITE_BUSY immediately.
-                    let _ = conn.busy_handler(Some(busy_retry));
-                    if limits::install_limits(conn, &limits).is_err() {
+                );
+                let mut conn = match opened {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(WorkerError::Startup {
+                            stage: "open",
+                            message: error.to_string(),
+                        }));
                         return;
                     }
-                    // These engine limits do not affect the server's own
-                    // lifecycle/schema SQL and mirror the Rust-side checks;
-                    // SQLITE_LIMIT_COLUMN and SQLITE_LIMIT_SQL_LENGTH stay
-                    // enforced in the Rust query path only, because engine
-                    // column/SQL caps can break the server's own schema
-                    // introspection statements.
-                    // Engine limits were installed and verified above.
-                    let _ = (
-                        limits.sql_byte_limit,
-                        limits.column_limit,
-                    );
-                    while let Some(cmd) = rx.blocking_recv() {
+                };
+                let setup = (|| -> Result<(), WorkerError> {
+                    if !conn.is_autocommit() {
+                        return Err(WorkerError::Startup {
+                            stage: "precondition",
+                            message: "connection was not in autocommit mode".into(),
+                        });
+                    }
+                    policy::install_authorizer(&conn, readonly, thread_flag.clone()).map_err(
+                        |error| WorkerError::Startup {
+                            stage: "authorizer",
+                            message: error.to_string(),
+                        },
+                    )?;
+                    conn.busy_handler(Some(busy_retry)).map_err(|error| {
+                        WorkerError::Startup {
+                            stage: "busy_handler",
+                            message: error.to_string(),
+                        }
+                    })?;
+                    limits::install_limits(&conn, &limits).map_err(|error| {
+                        WorkerError::Startup {
+                            stage: "limits",
+                            message: error.to_string(),
+                        }
+                    })?;
+                    policy::trusted(|| -> rusqlite::Result<()> {
+                        conn.pragma_update(None, "foreign_keys", true)?;
+                        conn.pragma_update(None, "recursive_triggers", true)?;
+                        for name in ["foreign_keys", "recursive_triggers"] {
+                            let sql = format!("PRAGMA {name}");
+                            let mut statement = conn.prepare(&sql)?;
+                            if statement.column_count() != 1 {
+                                return Err(rusqlite::Error::InvalidQuery);
+                            }
+                            let mut rows = statement.query([])?;
+                            let Some(row) = rows.next()? else {
+                                return Err(rusqlite::Error::QueryReturnedNoRows);
+                            };
+                            if row.get::<_, i64>(0)? != 1 || rows.next()?.is_some() {
+                                return Err(rusqlite::Error::InvalidQuery);
+                            }
+                        }
+                        Ok(())
+                    })
+                    .map_err(|error| WorkerError::Startup {
+                        stage: "connection_invariants",
+                        message: error.to_string(),
+                    })?;
+                    if !conn.is_autocommit() {
+                        return Err(WorkerError::Startup {
+                            stage: "postcondition",
+                            message: "connection left autocommit mode during setup".into(),
+                        });
+                    }
+                    thread_flag.reset_for_request();
+                    // SQL/column limits remain Rust-side because applying the
+                    // corresponding engine limits would constrain trusted
+                    // schema-introspection SQL.
+                    let _ = (limits.sql_byte_limit, limits.column_limit);
+                    Ok(())
+                })();
+                if let Err(error) = setup {
+                    let _ = ready_tx.send(Err(error));
+                    return;
+                }
+                if ready_tx.send(Ok(())).is_err() {
+                    return;
+                }
+                let mut expired = false;
+                let mut idle_deadline =
+                    test_support::now_ms().saturating_add(idle_seconds.saturating_mul(1000));
+                while let Some(cmd) = rx.blocking_recv() {
                         let busy_budget = Duration::from_millis(busy_wait_ms);
                         match cmd {
                             Command::Run(f, ctx, r) => {
@@ -415,7 +476,7 @@ impl Worker {
                                     }),
                                 );
                                 emit_first_sqlite_operation("run", "request");
-                                let mut result = f(conn, &ctx);
+                                let mut result = f(&mut conn, &ctx);
                                 test_support::emit(test_support::Event::BeginCompletion);
                                 let _ = conn.progress_handler(0, None::<fn() -> bool>);
                                 // Post-request cleanup (rollback verification,
@@ -535,8 +596,19 @@ impl Worker {
                                         });
                                     }
                                 }
+                                if thread_flag.policy_denied()
+                                    && !matches!(result, Err(WorkerError::Interrupted { .. }))
+                                {
+                                    let open = !conn.is_autocommit();
+                                    result = Err(WorkerError::PolicyDenied {
+                                        transaction_open: open,
+                                        transaction_continuable: open,
+                                    });
+                                }
+                                thread_flag.clear_source();
                                 idle_deadline = test_support::now_ms()
                                     .saturating_add(idle_seconds.saturating_mul(1000));
+                                drop(_busy_guard);
                                 let _ = r.send(result);
                                 test_support::emit(test_support::Event::RequestHandover);
                             }
@@ -567,7 +639,7 @@ impl Worker {
                                 // Control cleanup is deliberately not wired to a request token.
                                 emit_first_sqlite_operation("control", "normal");
                                 let result = f(
-                                    conn,
+                                    &mut conn,
                                     &RequestContext::new(Duration::from_secs(365 * 24 * 60 * 60)),
                                 );
                                 let _ = r.send(result);
@@ -703,17 +775,41 @@ impl Worker {
                             }
                         }
                     }
-                }
             })
             .map_err(|_| WorkerError::Closed)?;
         *join_handle.lock().expect("worker join slot poisoned") = Some(handle);
-        Ok(Self {
-            tx,
-            cancel,
-            mutation_seen,
-            join_handle,
-            completed: Arc::new(tokio::sync::OnceCell::new()),
-        })
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                tx,
+                cancel,
+                mutation_seen,
+                join_handle,
+                completed: Arc::new(tokio::sync::OnceCell::new()),
+            }),
+            Ok(Err(error)) => {
+                if let Some(handle) = join_handle
+                    .lock()
+                    .expect("worker join slot poisoned")
+                    .take()
+                {
+                    let _ = handle.join();
+                }
+                Err(error)
+            }
+            Err(_) => {
+                if let Some(handle) = join_handle
+                    .lock()
+                    .expect("worker join slot poisoned")
+                    .take()
+                {
+                    let _ = handle.join();
+                }
+                Err(WorkerError::Startup {
+                    stage: "readiness",
+                    message: "worker readiness channel disconnected".into(),
+                })
+            }
+        }
     }
     #[allow(dead_code)]
     pub async fn run_with_handle<F>(
@@ -965,8 +1061,15 @@ mod tests {
     /// and windows never overlap.
     fn assert_arm_window(command: &str, branches: &[&str]) {
         let arm = format!("{command}:arm");
-        let mut installs = seqs(Event::GuardInstalled, &arm);
-        let mut cleared = seqs(Event::GuardCleared, &arm);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let (mut installs, mut cleared) = loop {
+            let installs = seqs(Event::GuardInstalled, &arm);
+            let cleared = seqs(Event::GuardCleared, &arm);
+            if installs.len() == cleared.len() || Instant::now() >= deadline {
+                break (installs, cleared);
+            }
+            std::thread::yield_now();
+        };
         installs.sort_unstable();
         cleared.sort_unstable();
         assert!(

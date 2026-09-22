@@ -60,29 +60,148 @@ async fn sql_policy_escape_matrix() {
     core.shutdown().await;
 }
 
+fn assert_integer_one(result: &sqlite_mcp_core::QueryResult) {
+    assert_eq!(result.rows.len(), 1, "expected one row: {result:?}");
+    assert_eq!(result.rows[0].len(), 1, "expected one cell: {result:?}");
+    assert!(
+        matches!(&result.rows[0][0], Cell::Integer(value) if value == "1"),
+        "expected integer 1: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn approved_connection_pragma_getters_return_one() {
+    let dir = tempdir().unwrap();
+    let core = Core::new(Config::default()).unwrap();
+    let (path, _) = core
+        .create_database(dir.path().join("pragma.sqlite").to_str().unwrap())
+        .await
+        .unwrap();
+    for readonly in [false, true] {
+        let handle = core.open_database(&path, readonly).await.unwrap();
+        core.get_schema(&handle.id).await.unwrap();
+        core.begin_transaction(&handle.id, "deferred")
+            .await
+            .unwrap();
+        for sql in [
+            "PRAGMA foreign_keys",
+            "pragma recursive_triggers;",
+            " /* leading */ PRAGMA\nforeign_keys /* trailing */ ; -- done\n",
+        ] {
+            assert_integer_one(&core.query(&handle.id, sql, &[]).await.unwrap());
+        }
+        core.rollback(&handle.id).await.unwrap();
+        core.close_database(&handle.id).await.unwrap();
+    }
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn approved_pragma_setters_and_noncanonical_sources_remain_denied() {
+    let (_dir, core, _path, id) = setup().await;
+    for sql in [
+        "PRAGMA foreign_keys=ON",
+        "PRAGMA recursive_triggers(1)",
+        "PRAGMA main.foreign_keys",
+        "PRAGMA \"foreign_keys\"",
+        "PRAGMA /* split */ foreign_keys",
+        "EXPLAIN PRAGMA foreign_keys",
+        "PRAGMA user_version",
+        "PRAGMA journal_mode",
+        "SELECT * FROM pragma_foreign_keys",
+    ] {
+        let error = core.query(&id, sql, &[]).await.expect_err(sql);
+        assert!(
+            matches!(error, sqlite_mcp_core::CoreError::PolicyDenied { .. }),
+            "expected typed policy denial for {sql}, got {error:?}"
+        );
+        assert_integer_one(&core.query(&id, "PRAGMA foreign_keys", &[]).await.unwrap());
+    }
+    for sql in [
+        "PRAGMA foreign_keys()",
+        "PRAG/**/MA foreign_keys",
+        "PRAGMA foreign_keys garbage",
+        "PRAGMA journal_mode garbage",
+        "PRAGMA writable_schema garbage",
+        "CREATE VIEW malformed AS SELECT * FROM pragma_table_info('t') WHERE (",
+        "CREATE TRIGGER malformed AFTER INSERT ON t BEGIN SELECT * FROM pragma_table_info('t'); END garbage",
+        "ANALYZE garbage extra",
+        "REINDEX garbage extra",
+    ] {
+        let malformed = core
+            .query(&id, sql, &[])
+            .await
+            .expect_err("malformed pragma must fail");
+        assert!(
+            !matches!(malformed, sqlite_mcp_core::CoreError::PolicyDenied { .. }),
+            "malformed SQL must retain its SQLite class for {sql}: {malformed:?}"
+        );
+        core.query(&id, "SELECT 1", &[])
+            .await
+            .expect("transaction must recover after malformed SQL");
+    }
+    core.rollback(&id).await.unwrap();
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn valid_compound_trigger_and_second_statement_boundary_are_preserved() {
+    let (_dir, core, _path, id) = setup().await;
+    core.query(
+        &id,
+        "CREATE TRIGGER compound AFTER INSERT ON t BEGIN UPDATE t SET a = a; SELECT 1; END;",
+        &[],
+    )
+    .await
+    .unwrap();
+    for sql in [
+        "SELECT 1; PRAGMA foreign_keys",
+        "PRAGMA foreign_keys; SELECT 1",
+        "PRAGMA recursive_triggers; SELECT 1",
+    ] {
+        let error = core
+            .query(&id, sql, &[])
+            .await
+            .expect_err("second top-level statement must be rejected");
+        assert!(
+            !matches!(error, sqlite_mcp_core::CoreError::PolicyDenied { .. }),
+            "multiple statements must retain the boundary class: {error:?}"
+        );
+        core.query(&id, "SELECT 1", &[])
+            .await
+            .expect("transaction must recover after multiple statements");
+    }
+    core.rollback(&id).await.unwrap();
+    core.shutdown().await;
+}
+
 #[tokio::test]
 async fn schema_qualified_temp_objects_denied() {
     let (_dir, core, _path, id) = setup().await;
-    for sql in [
-        "CREATE TABLE temp.t2(a)",
-        "CREATE VIEW temp.v AS SELECT 1",
-        // `CREATE INDEX temp.i` never reaches the authorizer: SQLite
-        // structurally rejects a TEMP index on a non-TEMP table. The
-        // authorizer-level temp denial for CreateIndex is pinned by the
-        // policy unit decision table.
-        "CREATE INDEX temp.i ON t(a)",
-    ] {
+    for sql in ["CREATE TABLE temp.t2(a)", "CREATE VIEW temp.v AS SELECT 1"] {
         let err = core
             .query(&id, sql, &[])
             .await
             .err()
             .unwrap_or_else(|| panic!("temp-schema create accepted: {sql}"));
         assert!(
-            err.to_string().contains("not authorized")
-                || err.to_string().to_lowercase().contains("temp index"),
-            "expected denial for {sql}, got: {err}"
+            matches!(err, sqlite_mcp_core::CoreError::PolicyDenied { .. }),
+            "expected typed policy denial for {sql}, got: {err:?}"
         );
     }
+    // `CREATE INDEX temp.i` never reaches the authorizer: SQLite
+    // structurally rejects a TEMP index on a non-TEMP table. The
+    // authorizer-level temp denial for CreateIndex is pinned by the
+    // policy unit decision table, while this parser rejection must not be
+    // relabeled as a policy denial.
+    let temp_index = core
+        .query(&id, "CREATE INDEX temp.i ON t(a)", &[])
+        .await
+        .expect_err("TEMP index on a non-TEMP table must be rejected");
+    assert!(
+        !matches!(temp_index, sqlite_mcp_core::CoreError::PolicyDenied { .. }),
+        "SQLite parser rejection must retain its non-policy class: {temp_index:?}"
+    );
     // Controls: unqualified and `main.`-qualified creates succeed on the
     // writable handle.
     core.query(&id, "CREATE TABLE plain_t2(a)", &[])
@@ -129,7 +248,7 @@ async fn analyze_and_reindex_denied() {
             .err()
             .unwrap_or_else(|| panic!("maintenance operation accepted: {sql}"));
         assert!(
-            err.to_string().contains("maintenance operations"),
+            matches!(err, sqlite_mcp_core::CoreError::PolicyDenied { .. }),
             "expected maintenance policy denial for {sql}, got: {err}"
         );
     }

@@ -20,10 +20,19 @@ thread_local! {
 /// markers only. Core drains them unconditionally after each dispatched
 /// request; schema freshness is decided by the SQLite schema-cookie delta and
 /// confirmed statement outcome, not by authorizer classification alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApprovedPragma {
+    None = 0,
+    ForeignKeys = 1,
+    RecursiveTriggers = 2,
+}
+
 #[derive(Clone, Default)]
 pub struct MutationSignal {
     attempted: std::sync::Arc<AtomicBool>,
     ddl: std::sync::Arc<AtomicBool>,
+    policy_denied: std::sync::Arc<AtomicBool>,
+    approved_pragma: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 pub type MutationFlag = MutationSignal;
 impl MutationSignal {
@@ -31,11 +40,38 @@ impl MutationSignal {
         Self {
             attempted: std::sync::Arc::new(AtomicBool::new(false)),
             ddl: std::sync::Arc::new(AtomicBool::new(false)),
+            policy_denied: std::sync::Arc::new(AtomicBool::new(false)),
+            approved_pragma: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         }
     }
     pub fn reset_for_request(&self) {
         self.attempted.store(false, Ordering::SeqCst);
         self.ddl.store(false, Ordering::SeqCst);
+        self.policy_denied.store(false, Ordering::SeqCst);
+        self.approved_pragma.store(0, Ordering::SeqCst);
+    }
+    pub(crate) fn classify_source(&self, sql: &str) {
+        self.approved_pragma
+            .store(classify_approved_pragma(sql) as u8, Ordering::SeqCst);
+    }
+    pub(crate) fn clear_source(&self) {
+        self.approved_pragma.store(0, Ordering::SeqCst);
+    }
+    fn approved_pragma(&self) -> ApprovedPragma {
+        match self.approved_pragma.load(Ordering::SeqCst) {
+            1 => ApprovedPragma::ForeignKeys,
+            2 => ApprovedPragma::RecursiveTriggers,
+            _ => ApprovedPragma::None,
+        }
+    }
+    pub(crate) fn mark_policy_denied(&self) {
+        self.policy_denied.store(true, Ordering::SeqCst);
+    }
+    pub(crate) fn policy_denied(&self) -> bool {
+        self.policy_denied.load(Ordering::SeqCst)
+    }
+    pub(crate) fn clear_policy_denied(&self) {
+        self.policy_denied.store(false, Ordering::SeqCst);
     }
     pub fn mark_attempt(&self) {
         self.attempted.store(true, Ordering::SeqCst);
@@ -72,8 +108,86 @@ pub fn install_authorizer(
         if TRUSTED.with(Cell::get) {
             return Authorization::Allow;
         }
-        authorize(&ctx, readonly, &mutation_seen)
+        let decision = authorize(&ctx, readonly, &mutation_seen);
+        if decision == Authorization::Deny {
+            mutation_seen.mark_policy_denied();
+        }
+        decision
     }))
+}
+
+/// Recognize only the two direct connection-setting getter spellings admitted
+/// by the public query policy. SQLite remains the statement-boundary parser;
+/// this byte scanner only supplies source provenance to the authorizer.
+pub(crate) fn classify_approved_pragma(sql: &str) -> ApprovedPragma {
+    fn trivia(mut input: &[u8]) -> Option<&[u8]> {
+        loop {
+            while input
+                .first()
+                .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
+            {
+                input = &input[1..];
+            }
+            if input.starts_with(b"--") {
+                input = match input.iter().position(|b| *b == b'\n') {
+                    Some(i) => &input[i + 1..],
+                    None => &[],
+                };
+            } else if input.starts_with(b"/*") {
+                let end = input[2..].windows(2).position(|w| w == b"*/")?;
+                input = &input[end + 4..];
+            } else {
+                return Some(input);
+            }
+        }
+    }
+    fn take_ascii_word(input: &[u8]) -> (&[u8], &[u8]) {
+        let n = input
+            .iter()
+            .position(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+            .unwrap_or(input.len());
+        (&input[..n], &input[n..])
+    }
+    let Some(mut input) = trivia(sql.as_bytes()) else {
+        return ApprovedPragma::None;
+    };
+    let (keyword, rest) = take_ascii_word(input);
+    if !keyword.eq_ignore_ascii_case(b"pragma")
+        || rest
+            .first()
+            .is_none_or(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
+    {
+        return ApprovedPragma::None;
+    }
+    input = rest;
+    while input
+        .first()
+        .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
+    {
+        input = &input[1..];
+    }
+    let (name, rest) = take_ascii_word(input);
+    let approved = if name.eq_ignore_ascii_case(b"foreign_keys") {
+        ApprovedPragma::ForeignKeys
+    } else if name.eq_ignore_ascii_case(b"recursive_triggers") {
+        ApprovedPragma::RecursiveTriggers
+    } else {
+        return ApprovedPragma::None;
+    };
+    let Some(mut tail) = trivia(rest) else {
+        return ApprovedPragma::None;
+    };
+    if tail.starts_with(b";") {
+        tail = match trivia(&tail[1..]) {
+            Some(tail) => tail,
+            None => return ApprovedPragma::None,
+        };
+    }
+    if tail.is_empty() {
+        approved
+    } else {
+        ApprovedPragma::None
+    }
 }
 
 /// Internal decision-layer classification of an authorizer action. Every
@@ -102,7 +216,10 @@ pub(crate) enum ActionKind<'a> {
     },
     // Explicitly denied administrative/control actions.
     Unknown,
-    Pragma,
+    Pragma {
+        name: &'a str,
+        value: Option<&'a str>,
+    },
     Attach,
     Detach,
     Transaction,
@@ -148,7 +265,13 @@ impl<'a> ActionKind<'a> {
                 database: database_name,
             },
             AuthAction::Unknown { .. } => Self::Unknown,
-            AuthAction::Pragma { .. } => Self::Pragma,
+            AuthAction::Pragma {
+                pragma_name,
+                pragma_value,
+            } => Self::Pragma {
+                name: pragma_name,
+                value: *pragma_value,
+            },
             AuthAction::Attach { .. } => Self::Attach,
             AuthAction::Detach { .. } => Self::Detach,
             AuthAction::Transaction { .. } => Self::Transaction,
@@ -237,6 +360,7 @@ pub(crate) fn authorize(
     decide_kind(
         ActionKind::classify(&ctx.action),
         ctx.database_name,
+        ctx.accessor,
         readonly,
         mutation_seen,
     )
@@ -250,6 +374,7 @@ pub(crate) fn authorize(
 fn decide_kind(
     kind: ActionKind<'_>,
     database: Option<&str>,
+    accessor: Option<&str>,
     readonly: bool,
     mutation_seen: &MutationSignal,
 ) -> Authorization {
@@ -272,6 +397,21 @@ fn decide_kind(
     }
     match kind {
         ActionKind::Analyze => Authorization::Deny,
+        ActionKind::Pragma { name, value } => {
+            let source_matches = match mutation_seen.approved_pragma() {
+                ApprovedPragma::ForeignKeys => name.eq_ignore_ascii_case("foreign_keys"),
+                ApprovedPragma::RecursiveTriggers => {
+                    name.eq_ignore_ascii_case("recursive_triggers")
+                }
+                ApprovedPragma::None => false,
+            };
+            if source_matches && value.is_none() && database_is_main(database) && accessor.is_none()
+            {
+                Authorization::Allow
+            } else {
+                Authorization::Deny
+            }
+        }
         // `Reindex` is allowed at the authorizer because SQLite fires an
         // internal SQLITE_REINDEX event for every CREATE INDEX it executes;
         // blanket denial here would break ordinary index creation. Top-level
@@ -480,7 +620,7 @@ impl<'a> Cursor<'a> {
 /// statement's first keyword position is inspected, which cannot be an
 /// identifier in valid SQL, so this is a narrow guard in the shape of
 /// [`check_stored_body`], not a general keyword scan.
-pub fn check_maintenance(sql: &str) -> Result<(), PolicyError> {
+pub fn check_maintenance(sql: &str, policy_signal: &MutationSignal) -> Result<(), PolicyError> {
     let mut cursor = Cursor { rest: sql };
     let keyword = first_statement_keyword(&mut cursor);
     // `EXPLAIN [QUERY PLAN]` is a diagnostic prefix over an underlying
@@ -502,7 +642,10 @@ pub fn check_maintenance(sql: &str) -> Result<(), PolicyError> {
         other => other.map(ToOwned::to_owned),
     };
     match keyword.as_deref() {
-        Some("analyze") | Some("reindex") => Err(PolicyError::Maintenance),
+        Some("analyze") | Some("reindex") => {
+            policy_signal.mark_policy_denied();
+            Err(PolicyError::Maintenance)
+        }
         _ => Ok(()),
     }
 }
@@ -559,6 +702,7 @@ pub fn check_stored_body(sql: &str, mutation_seen: &MutationSignal) -> Result<()
         cursor.skip_object_name();
         cursor.skip_parenthesized();
         if contains_pragma_table_valued_call(cursor.rest) {
+            mutation_seen.mark_policy_denied();
             return Err(PolicyError::Denied);
         }
     }
@@ -732,6 +876,9 @@ pub fn prepare_exact(conn: &Connection, sql: &str) -> Result<(), PolicyError> {
                 unsafe {
                     ffi::sqlite3_finalize(stmt);
                 }
+            }
+            if compiled {
+                return Err(PolicyError::Multiple);
             }
             return Err(PolicyError::Denied);
         }
@@ -983,7 +1130,7 @@ mod tests {
         // denies it for every database name.
         for database in [None, Some("main"), Some("temp")] {
             assert_eq!(
-                decide_kind(ActionKind::Unmapped, database, false, &signal),
+                decide_kind(ActionKind::Unmapped, database, None, false, &signal),
                 Authorization::Deny,
                 "Unmapped must be denied (db={database:?})"
             );
@@ -1033,6 +1180,7 @@ mod tests {
     /// statement form alone (first-keyword position only).
     #[test]
     fn maintenance_guard_denies_top_level_only() {
+        let signal = MutationSignal::new();
         for sql in [
             "ANALYZE",
             "analyze",
@@ -1061,7 +1209,7 @@ mod tests {
             "EXPLAIN/**/QUERY/**/PLAN/**/REINDEX",
         ] {
             assert!(
-                check_maintenance(sql).is_err(),
+                check_maintenance(sql, &signal).is_err(),
                 "maintenance statement accepted: {sql:?}"
             );
         }
@@ -1080,7 +1228,7 @@ mod tests {
             "EXPLAIN QUERY PLAN CREATE INDEX i ON t(a)",
         ] {
             assert!(
-                check_maintenance(sql).is_ok(),
+                check_maintenance(sql, &signal).is_ok(),
                 "ordinary statement rejected: {sql:?}"
             );
         }

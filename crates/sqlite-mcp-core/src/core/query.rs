@@ -111,9 +111,12 @@ impl Core {
                     if before != expected_version {
                         return Err(WorkerError::Message("SCHEMA_STALE".into()));
                     }
-                    // Exactly-one-statement structural validation against the
-                    // real connection BEFORE any execution.
-                    match crate::policy::prepare_exact(c, &statement) {
+                    // SQLite is the authoritative parser and statement-boundary
+                    // detector. This first pass is trusted only so policy
+                    // callbacks cannot hide a parser/multiple-statement result;
+                    // no bytecode is executed. The real untrusted prepare below
+                    // remains authorizer-protected through step and reprepare.
+                    match crate::policy::trusted(|| crate::policy::prepare_exact(c, &statement)) {
                         Err(crate::policy::PolicyError::Multiple) => {
                             return Err(WorkerError::Message(
                                 "multiple SQL statements are not allowed".into(),
@@ -122,14 +125,21 @@ impl Core {
                         Err(crate::policy::PolicyError::Empty) => {
                             return Err(WorkerError::Message("SQL is empty".into()));
                         }
-                        _ => {}
+                        Err(error) => {
+                            return Err(WorkerError::Message(error.to_string()));
+                        }
+                        Ok(()) => {}
                     }
+                    // Source provenance is command-local and remains installed
+                    // through the real prepare, bind, step, and SQLite automatic
+                    // reprepare.
+                    mutation_signal.classify_source(&statement);
                     crate::policy::check_stored_body(&statement, &mutation_signal).map_err(
                         |e| WorkerError::Message(format!("statement is denied by SQL policy: {e}")),
                     )?;
-                    crate::policy::check_maintenance(&statement).map_err(|e| {
-                        WorkerError::Message(format!("statement is denied by SQL policy: {e}"))
-                    })?;
+                    crate::policy::check_maintenance(&statement, &mutation_signal).map_err(
+                        |e| WorkerError::Message(format!("statement is denied by SQL policy: {e}")),
+                    )?;
                     crate::policy::trusted(|| c.execute_batch("SAVEPOINT agent_stmt"))?;
                     let result = (|| {
                         let mut st = c.prepare(&statement)?;
@@ -226,6 +236,17 @@ impl Core {
                             }))
                         }
                         Err(e) => {
+                            // SQLite may invoke the authorizer before a later
+                            // parser/type error wins. Only SQLITE_AUTH may
+                            // retain callback-derived denial provenance;
+                            // malformed and unrelated SQLite failures keep
+                            // their native class.
+                            let authorization_failure = e
+                                .sqlite_extended_error_code()
+                                .is_some_and(|code| code & 0xff == rusqlite::ffi::SQLITE_AUTH);
+                            if !authorization_failure {
+                                mutation_signal.clear_policy_denied();
+                            }
                             if c.is_autocommit() {
                                 return Err(WorkerError::Message(format!(
                                     "outer transaction aborted: {e}"

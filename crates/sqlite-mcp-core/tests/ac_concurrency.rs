@@ -22,6 +22,8 @@ async fn open(path: &str, mut config: Config) -> (Core, String) {
 
 #[tokio::test]
 async fn harness_barrier_and_clock() {
+    let _hooks = sqlite_mcp_core::test_support::TEST_HOOK_LOCK.lock().await;
+    sqlite_mcp_core::test_support::reset_registry();
     let dir = tempdir().unwrap();
     let path = dir.path().join("h.sqlite");
     db(path.to_str().unwrap(), true);
@@ -156,6 +158,8 @@ async fn busy_commit_retains_transaction() {
 
 #[tokio::test]
 async fn stale_snapshot_upgrade() {
+    let _hooks = sqlite_mcp_core::test_support::TEST_HOOK_LOCK.lock().await;
+    sqlite_mcp_core::test_support::reset_registry();
     sqlite_mcp_core::test_support::set_clock_ms(0);
     let dir = tempdir().unwrap();
     let path = dir.path().join("snapshot.sqlite");

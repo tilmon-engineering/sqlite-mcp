@@ -139,6 +139,32 @@ async fn import_rejects_existing_output_and_malformed_header() {
         structured(&response)["error"]["class"].as_str(),
         Some("MERGE_FORMAT_INVALID") | Some("MERGE_POLICY_DENIED")
     ));
+    for pragma in ["PRAGMA foreign_keys;", "PRAGMA recursive_triggers;"] {
+        fs::write(
+            &sql,
+            format!(
+                "-- sqlite-mcp merge-format: 1\n-- sqlite-mcp schema-baseline: v1 count=0\n-- sqlite-mcp schema-baseline-end: v1\n{pragma}\n"
+            ),
+        )
+        .unwrap();
+        let response = fixture
+            .call(
+                "import_sqlite_text",
+                json!({
+                    "sql_path": sql,
+                    "output_path": output,
+                }),
+            )
+            .await;
+        assert!(
+            matches!(
+                structured(&response)["error"]["class"].as_str(),
+                Some("MERGE_FORMAT_INVALID") | Some("MERGE_POLICY_DENIED")
+            ),
+            "merge must blanket-deny {pragma}: {}",
+            structured(&response)
+        );
+    }
     fs::write(&output, []).unwrap();
     let response = fixture
         .call(

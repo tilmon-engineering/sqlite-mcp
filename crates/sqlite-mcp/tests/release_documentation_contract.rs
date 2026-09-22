@@ -85,9 +85,9 @@ fn release_documentation_contract() {
         assert!(readme.contains(target), "README is missing target {target}");
         assert!(
             readme.contains(&format!(
-                "https://github.com/tilmon-engineering/sqlite-mcp/releases/download/v0.2.0/sqlite-mcp-{target}.tar.gz"
+                "https://github.com/tilmon-engineering/sqlite-mcp/releases/download/v0.3.0/sqlite-mcp-{target}.tar.gz"
             )),
-            "README is missing immutable v0.2.0 download link for {target}"
+            "README is missing immutable v0.3.0 download link for {target}"
         );
         assert!(design.contains(target), "DESIGN is missing target {target}");
         assert!(

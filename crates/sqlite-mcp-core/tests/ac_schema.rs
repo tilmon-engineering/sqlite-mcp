@@ -46,6 +46,8 @@ async fn schema_gate_and_metadata() {
         .unwrap();
     assert!(!first.identity.is_empty());
     assert!(first.schema_version >= 1);
+    assert_eq!(first.user_version, 0);
+    assert_ne!(first.schema_version, first.user_version);
     assert!(
         first
             .objects
@@ -85,12 +87,22 @@ async fn schema_gate_and_metadata() {
             .strict
     );
     let child = first.tables.iter().find(|t| t.name == "child").unwrap();
-    assert!(
-        child
-            .foreign_keys
-            .iter()
-            .any(|f| f.table == "parent" && f.from == "parent_id" && f.to == "id")
-    );
+    let child_id = child
+        .columns
+        .iter()
+        .find(|column| column.name == "id")
+        .unwrap();
+    assert_eq!(child_id.primary_key_position, 1);
+    let foreign_key = child
+        .foreign_keys
+        .iter()
+        .find(|f| f.table == "parent" && f.from == "parent_id" && f.to == "id")
+        .unwrap();
+    assert_eq!(foreign_key.id, 0);
+    assert_eq!(foreign_key.sequence, 0);
+    assert_eq!(foreign_key.on_update, "NO ACTION");
+    assert_eq!(foreign_key.on_delete, "CASCADE");
+    assert_eq!(foreign_key.match_clause, "NONE");
     let second = core.get_schema(&id).await.unwrap();
     assert_eq!(
         serde_json::to_value(&first.objects).unwrap(),

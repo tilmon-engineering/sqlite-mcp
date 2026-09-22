@@ -18,6 +18,8 @@ async fn open_with(core: &Core, path: &str, readonly: bool) -> String {
 /// close/open recovers while already-committed data persists independently.
 #[tokio::test]
 async fn cross_cluster_lifecycle_query_scenarios() {
+    let _hooks = sqlite_mcp_core::test_support::TEST_HOOK_LOCK.lock().await;
+    sqlite_mcp_core::test_support::reset_registry();
     let dir = tempdir().unwrap();
     let path = dir.path().join("cross.sqlite");
     let core = Core::new(Config::default()).unwrap();

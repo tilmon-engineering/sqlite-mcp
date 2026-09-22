@@ -168,9 +168,10 @@ fn verified_asset_fixture(prefix: &str) -> (PathBuf, PathBuf) {
 #[test]
 fn verify_downloads_success_actual_native_binary() {
     let (dir, binary) = verified_asset_fixture("verify-success");
+    let current_tag = tag();
     let out = xtask(&[
         "verify-downloads",
-        "v0.2.0",
+        &current_tag,
         dir.to_str().unwrap(),
         binary.to_str().unwrap(),
     ]);
@@ -191,9 +192,10 @@ fn verify_downloads_corrupt_every_archive_prevents_execution() {
     ] {
         let (dir, _) = verified_asset_fixture("verify-corrupt");
         fs::write(dir.join(format!("sqlite-mcp-{target}.tar.gz")), b"corrupt").unwrap();
+        let current_tag = tag();
         let out = xtask(&[
             "verify-downloads",
-            "v0.2.0",
+            &current_tag,
             dir.to_str().unwrap(),
             "/definitely/not-executed",
         ]);
@@ -213,9 +215,10 @@ fn verify_downloads_omitting_every_asset_rejected() {
     ] {
         let (dir, _) = verified_asset_fixture("verify-omit");
         fs::remove_file(dir.join(missing)).unwrap();
+        let current_tag = tag();
         let out = xtask(&[
             "verify-downloads",
-            "v0.2.0",
+            &current_tag,
             dir.to_str().unwrap(),
             "/definitely/not-executed",
         ]);
@@ -229,9 +232,10 @@ fn verify_downloads_bad_binary() {
     let (dir, _) = verified_asset_fixture("verify-bad-binary");
     let bad = temp_dir("verify-bad-binary-file").join("bad");
     fs::write(&bad, b"not executable").unwrap();
+    let current_tag = tag();
     let out = xtask(&[
         "verify-downloads",
-        "v0.2.0",
+        &current_tag,
         dir.to_str().unwrap(),
         bad.to_str().unwrap(),
     ]);
@@ -264,9 +268,10 @@ fn native_archive_rejects_nonexecutable() {
         .find_map(|line| line.strip_prefix("host: "))
         .unwrap()
         .to_owned();
+    let current_tag = tag();
     let out = xtask(&[
         "package",
-        "v0.2.0",
+        &current_tag,
         &target,
         fake.to_str().unwrap(),
         outdir.to_str().unwrap(),

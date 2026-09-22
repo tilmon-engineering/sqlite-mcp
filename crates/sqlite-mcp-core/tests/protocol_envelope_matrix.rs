@@ -111,6 +111,50 @@ async fn envelope_state_matrix() {
 }
 
 #[tokio::test]
+async fn policy_denied_envelope_preserves_worker_lifecycle_and_recovers() {
+    let fixture = Fixture::new().await;
+    fixture
+        .call("create_database", json!({"path": fixture.path}))
+        .await;
+    let opened = fixture
+        .call(
+            "open_database",
+            json!({"path": fixture.path, "readonly": false}),
+        )
+        .await;
+    let id = handle(assert_envelope(&opened, false));
+    fixture.call("get_schema", json!({"handle": id})).await;
+    fixture
+        .call("begin_transaction", json!({"handle": id}))
+        .await;
+    for sql in [
+        "PRAGMA foreign_keys=OFF",
+        "SELECT * FROM pragma_table_info('x')",
+        "REINDEX",
+        "CREATE VIEW bad AS SELECT * FROM pragma_table_info('x')",
+    ] {
+        let denied = fixture
+            .call("query", json!({"handle": id, "sql": sql, "parameters": []}))
+            .await;
+        let error = assert_envelope(&denied, true)["error"].clone();
+        assert_eq!(error["class"], "POLICY_DENIED", "{sql}: {error}");
+        assert_eq!(error["transaction_open"], true, "{sql}: {error}");
+        assert_eq!(error["transaction_continuable"], true, "{sql}: {error}");
+        assert_envelope(
+            &fixture
+                .call("query", json!({"handle": id, "sql": "SELECT 1"}))
+                .await,
+            false,
+        );
+    }
+    assert_envelope(
+        &fixture.call("rollback", json!({"handle": id})).await,
+        false,
+    );
+    fixture.close().await;
+}
+
+#[tokio::test]
 async fn result_too_large_class_reported() {
     // A result payload exceeding the configured byte cap reports the
     // RESULT_TOO_LARGE class (not INTERNAL) with a truthful, usable

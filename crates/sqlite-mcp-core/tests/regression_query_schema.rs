@@ -1,3 +1,4 @@
+use sqlite_mcp_core::test_support::TEST_HOOK_LOCK as HOOK_LOCK;
 use sqlite_mcp_core::{Cell, Config, Core};
 use tempfile::{TempDir, tempdir};
 
@@ -30,9 +31,6 @@ async fn table_setup() -> (TempDir, Core, String) {
         .unwrap();
     (dir, core, id)
 }
-
-/// Serializes tests using the process-global event/fault hooks.
-static HOOK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
 async fn multiple_in_transaction_schema_and_data_queries() {
@@ -376,7 +374,6 @@ async fn dropped_caller_publishes_mutation_state() {
 
 #[tokio::test]
 async fn schema_cookie_external_ddl_interleaving() {
-    enable_hooks();
     let _hooks = HOOK_LOCK.lock().await;
     let (dir, core, id) = table_setup().await;
     core.rollback(&id).await.unwrap();

@@ -1,4 +1,5 @@
 use rusqlite::Connection;
+use sqlite_mcp_core::test_support::TEST_HOOK_LOCK as HOOK_LOCK;
 use sqlite_mcp_core::{Config, Core, CoreError, test_support};
 use std::time::Duration;
 use tempfile::tempdir;
@@ -31,12 +32,6 @@ async fn fixture(
 async fn clean(core: &Core) {
     core.shutdown().await;
 }
-
-/// Serializes process-global hook state (event registry arms, injected clock,
-/// fault registry) across tests in this binary: an armed gate pauses worker
-/// threads process-wide, so concurrent tests could otherwise capture each
-/// other's emissions.
-static HOOK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn enable_hooks() {
     unsafe { std::env::set_var("SQLITE_MCP_TEST_SUPPORT", "1") };
