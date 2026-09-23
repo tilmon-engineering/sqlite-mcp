@@ -10,7 +10,7 @@ The binary must keep stdout protocol-only. Diagnostics and operational logs use 
 
 ## 2. Public tools and lifecycle
 
-The advertised v1 tool set is exactly:
+The advertised thirteen-tool v1 set is exactly:
 
 | Tool | Contract |
 |---|---|
@@ -20,6 +20,8 @@ The advertised v1 tool set is exactly:
 | `get_schema(handle: string)` | Capture complete bounded schema metadata and an observation token. |
 | `begin_transaction(handle: string, mode: "deferred" | "immediate" = "deferred")` | Begin only after schema observation. `immediate` is rejected on readonly handles. |
 | `query(handle: string, sql: string, parameters: typed-value[] = [])` | Execute exactly one statement in the active transaction with positional SQLite-index bindings. |
+| `query_batch(handle: string, sql: string)` | Execute a bounded parameterless SQL batch in SQLite native tail order and return ordered per-statement results. |
+| `execute_sql_file(handle: string, sql_path: string)` | Read a bounded absolute regular UTF-8 SQL file with one rejection-only sentinel byte and execute it using the parameterless batch contract; return normalized `sql_path` metadata. |
 | `commit(handle: string)` | Commit and close active work, including read-only work. No active transaction is an explicit error. |
 | `rollback(handle: string)` | Roll back active work. Valid idle handles receive idempotent success. |
 | `close_database(handle: string)` | Close an idle handle. Active work is refused with the authoritative transaction state and exact commit/rollback next moves; failed close attempts that cannot verify cleanup leave the handle unusable (subsequent calls report `HANDLE_UNKNOWN` until a fresh open). |
@@ -56,7 +58,7 @@ Every request has its own cancellation token and deadline installed in the worke
 
 Install a fail-closed SQLite authorizer during prepare, step, and automatic reprepare; unknown actions and any authorizer action not explicitly allowed are denied (the wildcard default is Deny). Trusted worker scopes are limited to server-owned lifecycle/schema/configuration SQL; agent SQL cannot enter them. The only agent PRAGMA exception is a direct ASCII-case-insensitive `PRAGMA foreign_keys` or `PRAGMA recursive_triggers` getter: it requires whitespace after `PRAGMA`, one unquoted and unqualified approved name, no value/parentheses/parameters, no `EXPLAIN`, at most one terminal semicolon, only surrounding SQLite ASCII whitespace/comments, authorizer database absent or canonical `main`, and no stored-body accessor; each returns exactly one integer cell `1`. Setters, other source forms, every other PRAGMA, `pragma_*` table-valued functions (including through views/triggers), and unknown actions remain denied. Also deny agent transaction/savepoint control, ATTACH/DETACH, extension loading (including the `load_extension` SQL function), TEMP objects, virtual tables, writable schema/configuration changes, VACUUM/VACUUM INTO, and filesystem-output/maintenance operations. Schema-qualified access to `temp` (e.g. `CREATE TABLE temp.t`) is denied like TEMP objects: object-scoped actions whose authorizer database qualifier is neither absent nor `main` are denied, and `ALTER TABLE` carries its qualifier in the action payload. `ANALYZE` is denied at the authorizer; `REINDEX` is denied by a first-keyword structural guard at the statement boundary because SQLite fires an internal reindex authorizer event for every `CREATE INDEX` it executes, so the authorizer cannot distinguish the two and must allow that event. A stored-body structural guard rejects `CREATE VIEW` or `CREATE TRIGGER` whose body contains a `pragma_*` table-valued function call in any identifier quoting (SQLite accepts quoted identifiers in call position), while bare `pragma_`-containing names, aliases, comments, and string literals pass, because SQLite does not expose those body references to the authorizer at CREATE time. The authorizer also protects trigger-induced operations and readonly connections. Ordinary SELECT/CTE/DML and transactional CREATE/ALTER/DROP of ordinary tables/indexes/views/triggers are allowed on writable handles. `EXPLAIN` of a denied statement is denied as well; `EXPLAIN QUERY PLAN` remains allowed when its underlying query is allowed.
 
-Validate exactly one compiled statement using SQLite parser/tail handling on the real connection before executing anything. Allow whitespace/comments/trailing semicolon; reject empty SQL, malformed tails, and a second statement. Never use regex splitting or execute_batch. Wrap every agent statement in a server-owned savepoint, including SELECT. On success drain to SQLITE_DONE, finalize, and release. On error, rollback-to/release if the outer transaction survives; earlier successful calls remain. If SQLite aborts the outer transaction (for example `OR ROLLBACK`) or savepoint restoration fails, report that observed fact and never recreate the transaction.
+Legacy `query` validates exactly one compiled statement using SQLite parser/tail handling on the real connection before executing anything. Batch tools use the same SQLite-native tail pointers to discover non-empty statements and execute them in order. Batch inputs are parameterless; a bound parameter is rejected by SQLite. Allow whitespace/comments/trailing semicolon; reject empty SQL and malformed tails. Never use regex splitting or execute_batch for agent SQL. Wrap every agent statement in a server-owned savepoint, including SELECT. On success drain to SQLITE_DONE, finalize, and release. On error, rollback-to/release if the outer transaction survives; earlier successful calls remain. If SQLite aborts the outer transaction (for example `OR ROLLBACK`) or savepoint restoration fails, report that observed fact and never recreate the transaction.
 
 Output caps do not stop execution: drain DML `RETURNING` fully, discard excess rows only after completion, and report `execution_complete`. Defaults are 500 rows, 1 MiB result payload, 1 MiB individual SQLite length, 100 KiB SQL, 256 columns, 1000 parameters, expression depth 100, and 50 compound SELECT terms. Configurable positive overrides require bounded sensible maxima. No automatic LIMIT or pagination cursor is added; `next_moves` recommends explicit ordered/keyset pagination.
 
@@ -87,6 +89,8 @@ The TOML model is process-wide (not per-handle or per-database) and loaded once 
 | `max_handles` | `32` | Positive; 1..=1024. Maximum live handles. |
 | `queue_capacity` | `16` | Positive; 1..=4096. Per-handle command queue capacity. |
 | `query_timeout_ms` | `30000` | Positive; 1..=300000. Query/deadline budget in milliseconds. |
+| `batch_sql_byte_limit` | `1048576` | Positive; 1..=16777216. Maximum inline/file batch SQL bytes; file reads use one additional rejection-only sentinel byte. |
+| `batch_statement_limit` | `1000` | Positive; 1..=100000. Maximum non-empty SQLite statements per batch. |
 | `writable_idle_seconds` | `60` | Positive; 1..=86400. Writable transaction idle expiry. |
 | `readonly_idle_seconds` | `600` | Positive; 1..=604800. Readonly transaction idle expiry. |
 | `result_row_limit` | `500` | Positive; 1..=100000. Maximum returned rows. |

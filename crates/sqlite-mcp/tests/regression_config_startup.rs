@@ -4,7 +4,7 @@ use std::{
 };
 use tempfile::tempdir;
 
-const FIELDS: [(&str, u64); 15] = [
+const FIELDS: [(&str, u64); 17] = [
     ("max_handles", 1024),
     ("queue_capacity", 4096),
     ("query_timeout_ms", 300_000),
@@ -16,6 +16,8 @@ const FIELDS: [(&str, u64); 15] = [
     ("cell_byte_limit", 67_108_864),
     ("busy_wait_ms", 60_000),
     ("sql_byte_limit", 1_048_576),
+    ("batch_sql_byte_limit", 16_777_216),
+    ("batch_statement_limit", 100_000),
     ("column_limit", 2048),
     ("parameter_limit", 32_766),
     ("expression_depth", 1000),

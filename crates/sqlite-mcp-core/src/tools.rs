@@ -19,13 +19,15 @@ tokio::task_local! {
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-const TOOLS: [&str; 11] = [
+const TOOLS: [&str; 13] = [
     "create_database",
     "open_database",
     "list_handles",
     "get_schema",
     "begin_transaction",
     "query",
+    "query_batch",
+    "execute_sql_file",
     "commit",
     "rollback",
     "close_database",
@@ -119,6 +121,18 @@ pub struct QueryArgs {
     #[serde(default)]
     pub parameters: Vec<TypedValue>,
 }
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BatchArgs {
+    pub handle: String,
+    pub sql: String,
+}
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SqlFileArgs {
+    pub handle: String,
+    pub sql_path: String,
+}
 
 #[derive(Clone)]
 pub struct McpServer {
@@ -173,8 +187,20 @@ fn next(name: &str) -> Vec<String> {
             "close_database".into(),
         ],
         "get_schema" => vec!["begin_transaction".into(), "get_schema".into()],
-        "begin_transaction" => vec!["query".into(), "commit".into(), "rollback".into()],
-        "query" => vec!["query".into(), "commit".into(), "rollback".into()],
+        "begin_transaction" => vec![
+            "query".into(),
+            "query_batch".into(),
+            "execute_sql_file".into(),
+            "commit".into(),
+            "rollback".into(),
+        ],
+        "query" | "query_batch" | "execute_sql_file" => vec![
+            "query".into(),
+            "query_batch".into(),
+            "execute_sql_file".into(),
+            "commit".into(),
+            "rollback".into(),
+        ],
         "commit" | "rollback" => vec![
             "begin_transaction".into(),
             "get_schema".into(),
@@ -527,6 +553,74 @@ impl McpServer {
                     .into_iter()
                     .find(|h| h.id == a.handle);
                 error("query", e, handle.as_ref())
+            }
+        }
+    }
+    #[tool(
+        name = "query_batch",
+        description = "Execute a bounded parameterless SQL batch inside an explicit transaction. Statements are discovered with SQLite native tail pointers, executed in order, and returned as ordered results; the batch input has no positional-parameter contract."
+    )]
+    async fn query_batch(&self, Parameters(a): Parameters<BatchArgs>) -> CallToolResult {
+        match self
+            .core
+            .query_batch_with_ct(&a.handle, &a.sql, REQUEST_CT.try_with(Clone::clone).ok())
+            .await
+        {
+            Ok(results) => {
+                let handle = self
+                    .core
+                    .list_handles()
+                    .await
+                    .into_iter()
+                    .find(|h| h.id == a.handle);
+                ok("query_batch", handle.as_ref(), json!({"results": results}))
+            }
+            Err(e) => {
+                let handle = self
+                    .core
+                    .list_handles()
+                    .await
+                    .into_iter()
+                    .find(|h| h.id == a.handle);
+                error("query_batch", e, handle.as_ref())
+            }
+        }
+    }
+    #[tool(
+        name = "execute_sql_file",
+        description = "Read a bounded absolute regular UTF-8 SQL file and execute its parameterless statements in order inside an explicit transaction. The file is read with a one-byte oversize sentinel and its normalized path is returned."
+    )]
+    async fn execute_sql_file(&self, Parameters(a): Parameters<SqlFileArgs>) -> CallToolResult {
+        match self
+            .core
+            .execute_sql_file_with_ct(
+                &a.handle,
+                &a.sql_path,
+                REQUEST_CT.try_with(Clone::clone).ok(),
+            )
+            .await
+        {
+            Ok((sql_path, results)) => {
+                let handle = self
+                    .core
+                    .list_handles()
+                    .await
+                    .into_iter()
+                    .find(|h| h.id == a.handle);
+                ok(
+                    "execute_sql_file",
+                    handle.as_ref(),
+                    json!({"sql_path": sql_path, "results": results}),
+                )
+            }
+            Err(e) => {
+                let handle = self
+                    .core
+                    .list_handles()
+                    .await
+                    .into_iter()
+                    .find(|h| h.id == a.handle);
+                error("execute_sql_file", e, handle.as_ref())
             }
         }
     }

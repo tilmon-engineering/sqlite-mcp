@@ -114,13 +114,15 @@ pub fn assert_envelope(response: &CallToolResult, error: bool) -> &Value {
     value
 }
 
-pub const NAMES: [&str; 11] = [
+pub const NAMES: [&str; 13] = [
     "create_database",
     "open_database",
     "list_handles",
     "get_schema",
     "begin_transaction",
     "query",
+    "query_batch",
+    "execute_sql_file",
     "commit",
     "rollback",
     "close_database",

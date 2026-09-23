@@ -25,6 +25,10 @@ pub struct Config {
     pub busy_wait_ms: u64,
     #[serde(default = "default_sql_limit")]
     pub sql_byte_limit: usize,
+    #[serde(default = "default_batch_sql_byte_limit")]
+    pub batch_sql_byte_limit: usize,
+    #[serde(default = "default_batch_statement_limit")]
+    pub batch_statement_limit: usize,
     #[serde(default = "default_cell_limit")]
     pub cell_byte_limit: usize,
     #[serde(default = "default_columns")]
@@ -71,6 +75,12 @@ fn default_schema_byte_limit() -> usize {
 fn default_sql_limit() -> usize {
     100 * 1024
 }
+fn default_batch_sql_byte_limit() -> usize {
+    1024 * 1024
+}
+fn default_batch_statement_limit() -> usize {
+    1000
+}
 fn default_cell_limit() -> usize {
     1024 * 1024
 }
@@ -114,6 +124,8 @@ impl Default for Config {
             schema_byte_limit: default_schema_byte_limit(),
             busy_wait_ms: 2_000,
             sql_byte_limit: 100 * 1024,
+            batch_sql_byte_limit: default_batch_sql_byte_limit(),
+            batch_statement_limit: default_batch_statement_limit(),
             cell_byte_limit: 1024 * 1024,
             column_limit: 256,
             parameter_limit: 1000,
@@ -137,7 +149,7 @@ pub enum ConfigError {
 }
 impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
-        const POLICY: [(&str, u128, u128); 19] = [
+        const POLICY: [(&str, u128, u128); 21] = [
             ("max_handles", 1, 1024),
             ("queue_capacity", 1, 4096),
             ("query_timeout_ms", 1, 300_000),
@@ -149,6 +161,8 @@ impl Config {
             ("cell_byte_limit", 1, 67_108_864),
             ("busy_wait_ms", 1, 60_000),
             ("sql_byte_limit", 1, 1_048_576),
+            ("batch_sql_byte_limit", 1, 16_777_216),
+            ("batch_statement_limit", 1, 100_000),
             ("column_limit", 1, 2048),
             ("parameter_limit", 1, 32_766),
             ("expression_depth", 1, 1000),
@@ -170,6 +184,8 @@ impl Config {
             ("cell_byte_limit", self.cell_byte_limit as u128),
             ("busy_wait_ms", self.busy_wait_ms as u128),
             ("sql_byte_limit", self.sql_byte_limit as u128),
+            ("batch_sql_byte_limit", self.batch_sql_byte_limit as u128),
+            ("batch_statement_limit", self.batch_statement_limit as u128),
             ("column_limit", self.column_limit as u128),
             ("parameter_limit", self.parameter_limit as u128),
             ("expression_depth", self.expression_depth as u128),

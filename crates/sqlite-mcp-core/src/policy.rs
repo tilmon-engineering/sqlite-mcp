@@ -856,50 +856,111 @@ pub fn unknown_action_denied() -> bool {
         AuthAction::Unknown { .. }
     )
 }
-pub fn prepare_exact(conn: &Connection, sql: &str) -> Result<(), PolicyError> {
-    if sql.as_bytes().contains(&0) {
-        return Err(PolicyError::Denied);
-    }
-    if sql.trim().is_empty() {
-        return Err(PolicyError::Empty);
-    }
-    let c = CString::new(sql).map_err(|_| PolicyError::Denied)?;
-    let mut tail = c.as_ptr();
-    let end = unsafe { tail.add(c.as_bytes().len()) };
-    let mut compiled = false;
-    loop {
-        let mut stmt = ptr::null_mut();
-        let mut next = ptr::null();
-        let rc = unsafe { ffi::sqlite3_prepare_v2(conn.handle(), tail, -1, &mut stmt, &mut next) };
-        if rc != ffi::SQLITE_OK {
-            if !stmt.is_null() {
-                unsafe {
-                    ffi::sqlite3_finalize(stmt);
-                }
-            }
-            if compiled {
-                return Err(PolicyError::Multiple);
-            }
+/// Native SQLite tail traversal for a caller-owned SQL buffer.
+///
+/// `sqlite3_prepare_v2` is used only for statement discovery here; every
+/// returned discovery statement is finalized before the next tail is visited.
+/// The caller keeps the original SQL string alive and uses the returned byte
+/// range for the authorizer-protected execution prepare.
+pub(crate) struct TailCursor {
+    source: String,
+    buffer: CString,
+    offset: usize,
+    end: usize,
+}
+
+impl TailCursor {
+    pub(crate) fn new(sql: &str) -> Result<Self, PolicyError> {
+        if sql.as_bytes().contains(&0) {
             return Err(PolicyError::Denied);
         }
-        if !stmt.is_null() {
-            if compiled {
-                unsafe {
-                    ffi::sqlite3_finalize(stmt);
-                }
-                return Err(PolicyError::Multiple);
+        if sql.trim().is_empty() {
+            return Err(PolicyError::Empty);
+        }
+        let buffer = CString::new(sql).map_err(|_| PolicyError::Denied)?;
+        let end = buffer.as_bytes().len();
+        Ok(Self {
+            source: sql.to_owned(),
+            buffer,
+            offset: 0,
+            end,
+        })
+    }
+
+    pub(crate) fn sql(&self, range: &std::ops::Range<usize>) -> &str {
+        &self.source[range.clone()]
+    }
+
+    pub(crate) fn next(
+        &mut self,
+        conn: &Connection,
+    ) -> Result<Option<std::ops::Range<usize>>, PolicyError> {
+        loop {
+            if self.offset >= self.end {
+                return Ok(None);
             }
-            compiled = true;
+            let base = self.buffer.as_ptr();
+            let tail = unsafe { base.add(self.offset) };
+            let mut stmt = ptr::null_mut();
+            let mut next = ptr::null();
+            let rc =
+                unsafe { ffi::sqlite3_prepare_v2(conn.handle(), tail, -1, &mut stmt, &mut next) };
+            if rc != ffi::SQLITE_OK {
+                if !stmt.is_null() {
+                    unsafe {
+                        ffi::sqlite3_finalize(stmt);
+                    }
+                }
+                return Err(PolicyError::Denied);
+            }
+            let next_offset = if next.is_null() {
+                self.end
+            } else {
+                let delta = unsafe { next.offset_from(base) };
+                if delta < 0 || delta as usize > self.end {
+                    if !stmt.is_null() {
+                        unsafe {
+                            ffi::sqlite3_finalize(stmt);
+                        }
+                    }
+                    return Err(PolicyError::Denied);
+                }
+                delta as usize
+            };
+            if next_offset <= self.offset {
+                if !stmt.is_null() {
+                    unsafe {
+                        ffi::sqlite3_finalize(stmt);
+                    }
+                }
+                return Err(PolicyError::Denied);
+            }
+            let range = self.offset..next_offset;
+            self.offset = next_offset;
+            if stmt.is_null() {
+                if self.offset >= self.end {
+                    return Ok(None);
+                }
+                continue;
+            }
             unsafe {
                 ffi::sqlite3_finalize(stmt);
             }
+            return Ok(Some(range));
         }
-        if next.is_null() || next == tail {
-            break;
-        }
-        tail = next;
-        if tail >= end {
-            break;
+    }
+}
+
+pub fn prepare_exact(conn: &Connection, sql: &str) -> Result<(), PolicyError> {
+    let mut cursor = TailCursor::new(sql)?;
+    let mut compiled = false;
+    loop {
+        match cursor.next(conn) {
+            Ok(Some(_)) if compiled => return Err(PolicyError::Multiple),
+            Ok(Some(_)) => compiled = true,
+            Ok(None) => break,
+            Err(_) if compiled => return Err(PolicyError::Multiple),
+            Err(error) => return Err(error),
         }
     }
     if !compiled {

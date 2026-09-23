@@ -41,6 +41,18 @@ async fn tool_contract_and_bootstrap() {
                 }
                 assert!(properties.contains_key("parameters"));
             }
+            "query_batch" => {
+                assert_eq!(properties.len(), 2);
+                for field in ["handle", "sql"] {
+                    assert!(required.iter().any(|v| v == field));
+                }
+            }
+            "execute_sql_file" => {
+                assert_eq!(properties.len(), 2);
+                for field in ["handle", "sql_path"] {
+                    assert!(required.iter().any(|v| v == field));
+                }
+            }
             "begin_transaction" => {
                 assert!(required.iter().any(|v| v == "handle"));
                 // rmcp 1.7 / schemars 1.2 do not advertise field defaults in

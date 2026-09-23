@@ -20,12 +20,14 @@ fn stdio_protocol_scenario() {
             "close_database",
             "commit",
             "create_database",
+            "execute_sql_file",
             "extract_sqlite_merge",
             "get_schema",
             "import_sqlite_text",
             "list_handles",
             "open_database",
             "query",
+            "query_batch",
             "rollback"
         ]
     );
@@ -69,8 +71,24 @@ fn stdio_protocol_scenario() {
         json!({"name":"get_schema","arguments":{"handle":handle}}),
     );
     support::assert_ok(&reobserve);
-    let insert = server.request(9, "tools/call", json!({"name":"query","arguments":{"handle":handle,"sql":"INSERT INTO t VALUES (?, ?)","parameters":[{"type":"integer","value":"1"},{"type":"text","value":"one"}]}}));
+    let batch_file = dir.path().join("batch.sql");
+    std::fs::write(
+        &batch_file,
+        "INSERT INTO t VALUES (1, 'one'); SELECT id, name FROM t",
+    )
+    .unwrap();
+    let insert = server.request(
+        9,
+        "tools/call",
+        json!({"name":"execute_sql_file","arguments":{"handle":handle,"sql_path":batch_file.to_str().unwrap()}}),
+    );
     support::assert_ok(&insert);
+    assert_eq!(
+        insert["result"]["structuredContent"]["result"]["results"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
     server.request(
         10,
         "tools/call",

@@ -12,6 +12,8 @@ fn example_config_loads() {
     assert_eq!(config.max_handles, 32);
     assert_eq!(config.queue_capacity, 16);
     assert_eq!(config.query_timeout_ms, 30_000);
+    assert_eq!(config.batch_sql_byte_limit, 1_048_576);
+    assert_eq!(config.batch_statement_limit, 1_000);
 }
 
 #[test]

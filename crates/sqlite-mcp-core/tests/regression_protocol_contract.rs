@@ -8,7 +8,7 @@ use support::{Fixture, NAMES};
 async fn closed_tool_schema_matrix() {
     let fixture = Fixture::new().await;
     let tools = fixture.tools().await;
-    assert_eq!(tools.len(), 11);
+    assert_eq!(tools.len(), 13);
     let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     names.sort_unstable();
     let mut expected = NAMES.to_vec();

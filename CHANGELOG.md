@@ -4,6 +4,22 @@ All notable changes are documented here from observed repository history. Releas
 
 Provisional first-release notes were finalized from inspected history spanning root commit `2684862` through implementation commit `e9544c5`; the subsequent notes-only commits are not part of that inspected history.
 
+## [0.4.0] - 2026-09-23
+
+### Added
+
+- Added parameterless `query_batch` and `execute_sql_file` tools for bounded multi-statement SQL execution with ordered per-statement results.
+- Added SQLite-native statement-tail traversal, bounded batch SQL input, and bounded batch statement-count configuration.
+
+### Fixed
+
+- Preserved legacy `query` one-statement and positional-parameter semantics while sharing the native execution path with batch tools.
+- Preserved transaction-local schema usability after a successful batch DDL statement followed by a later batch failure.
+
+### Platform notes
+
+Release targets and runtime requirements are unchanged: Linux GNU/glibc builds use Ubuntu 24.04, and macOS artifacts target macOS 15 and remain unsigned and unnotarized.
+
 ## [0.3.2] - 2026-09-23
 
 ### Changed
