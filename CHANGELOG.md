@@ -8,7 +8,11 @@ Provisional first-release notes were finalized from inspected history spanning r
 
 ### Changed
 
-- Provisional: 0.3.2 patch release with unchanged SQLite MCP behavior; finalize from inspected implementation history.
+Notes were finalized from inspected history spanning published `v0.3.1` through implementation commit `03e0e7c` (1 commit); this subsequent notes-only commit is not part of that inspected history.
+
+### Changed
+
+- Bumped the compiled release version to 0.3.2; SQLite MCP behavior is unchanged from 0.3.1.
 
 ### Platform notes
 
