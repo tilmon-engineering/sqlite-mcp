@@ -6,7 +6,11 @@ Provisional first-release notes were finalized from inspected history spanning r
 
 ## [0.3.1] - 2026-09-23
 
-Provisional notes: release publisher fixes are described after reviewing the implementation commit and observed history since `v0.3.0`; final notes will follow separately.
+Notes were finalized from inspected history spanning published `v0.3.0` through implementation commit `e84574e` (1 commit); this subsequent notes-only commit is not part of that inspected history.
+
+### Fixed
+
+- Release publishing accepts GitHub's reordered release-asset list while still requiring the exact duplicate-free asset set, and stable releases explicitly request GitHub's Latest designation after verifying downloaded assets. Prereleases continue to publish without requesting Latest.
 
 ## [0.3.0] - 2026-09-22
 
