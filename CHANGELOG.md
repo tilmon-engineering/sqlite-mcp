@@ -6,6 +6,8 @@ Provisional first-release notes were finalized from inspected history spanning r
 
 ## [0.4.0] - 2026-09-23
 
+Notes were finalized from inspected history spanning published `v0.3.2` through implementation commit `6f91765` (1 commit); this subsequent notes-only commit is not part of that inspected history.
+
 ### Added
 
 - Added parameterless `query_batch` and `execute_sql_file` tools for bounded multi-statement SQL execution with ordered per-statement results.
