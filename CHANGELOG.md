@@ -4,6 +4,10 @@ All notable changes are documented here from observed repository history. Releas
 
 Provisional first-release notes were finalized from inspected history spanning root commit `2684862` through implementation commit `e9544c5`; the subsequent notes-only commits are not part of that inspected history.
 
+## [0.3.1] - 2026-09-23
+
+Provisional notes: release publisher fixes are described after reviewing the implementation commit and observed history since `v0.3.0`; final notes will follow separately.
+
 ## [0.3.0] - 2026-09-22
 
 Notes were finalized from inspected history spanning published `v0.2.0` through implementation commit `3c981a7` (1 commit); this subsequent notes-only commit is not part of that inspected history.

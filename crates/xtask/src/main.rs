@@ -565,7 +565,7 @@ fn publish_release<R: CommandRunner>(
         }
         if release.tag != tag
             || release.target != expected_sha
-            || release.assets != expected_names
+            || !exact_membership(&release.assets, &expected_names)
             || !notes_equivalent(&release.body, notes_body)
             || release.prerelease != prerelease
         {
@@ -606,7 +606,7 @@ fn publish_release<R: CommandRunner>(
         if created.published
             || created.tag != tag
             || created.target != expected_sha
-            || created.assets != expected_names
+            || !exact_membership(&created.assets, &expected_names)
             || !notes_equivalent(&created.body, notes_body)
             || created.prerelease != prerelease
         {
@@ -653,11 +653,11 @@ fn publish_release<R: CommandRunner>(
                 ));
             }
         }
-        let output = runner.run(
-            "gh",
-            &[arg("release"), arg("edit"), arg(tag), arg("--draft=false")],
-            Some(root),
-        )?;
+        let mut edit_args = vec![arg("release"), arg("edit"), arg(tag), arg("--draft=false")];
+        if !prerelease {
+            edit_args.push(arg("--latest"));
+        }
+        let output = runner.run("gh", &edit_args, Some(root))?;
         successful(&output, "gh release publish")
     })();
     let _ = fs::remove_dir_all(&download_dir);
@@ -1455,6 +1455,7 @@ mod tests {
         postcreate_release: Option<String>,
         extra_release: Option<String>,
         publish_called: bool,
+        edit_args: Vec<String>,
         public_responses: Vec<String>,
         public_http_failure: bool,
         /// Queued raw REST release-list pages (snake_case payloads). Served
@@ -1579,6 +1580,7 @@ mod tests {
             }
             if program == "gh" && args.get(1).map(String::as_str) == Some("edit") {
                 self.publish_called = true;
+                self.edit_args = args.to_vec();
                 return Ok(output(0, "", ""));
             }
             Err(format!("unexpected command {program} {args:?}"))
@@ -1592,16 +1594,22 @@ mod tests {
         }
     }
     fn release_json(draft: bool, target: &str, body: &str) -> String {
-        let assets = archive_names()
+        release_json_with(draft, false, target, body, &release_names())
+    }
+    fn release_json_with(
+        draft: bool,
+        prerelease: bool,
+        target: &str,
+        body: &str,
+        names: &[String],
+    ) -> String {
+        let assets = names
             .iter()
             .map(|name| format!(r#"{{"name":"{name}","size":1}}"#))
-            .chain(std::iter::once(
-                r#"{"name":"SHA256SUMS","size":1}"#.to_owned(),
-            ))
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            r#"{{"draft":{draft},"prerelease":false,"tag_name":"v1.0.0","target_commitish":"{target}","body":"{body}","assets":[{assets}]}}"#
+            r#"{{"draft":{draft},"prerelease":{prerelease},"tag_name":"v1.0.0","target_commitish":"{target}","body":"{body}","assets":[{assets}]}}"#
         )
     }
     fn run_publish(
@@ -1609,11 +1617,48 @@ mod tests {
         release: Option<String>,
         root: &Path,
     ) -> Result<(), String> {
+        run_publish_with(fake, release, root, false)
+    }
+    fn run_publish_with(
+        fake: &mut FakeRunner,
+        release: Option<String>,
+        root: &Path,
+        prerelease: bool,
+    ) -> Result<(), String> {
         fake.release = release;
         let notes = root.join("notes");
         fs::write(&notes, "notes").unwrap();
         let assets = local_assets(root);
-        publish_release(fake, root, "v1.0.0", "sha", &notes, "notes", &assets, false)
+        publish_release(
+            fake, root, "v1.0.0", "sha", &notes, "notes", &assets, prerelease,
+        )
+    }
+    fn reordered_release_names() -> Vec<String> {
+        std::iter::once("SHA256SUMS".to_owned())
+            .chain(archive_names().iter().map(|name| (*name).to_owned()))
+            .collect()
+    }
+    fn assert_published_after_download_verification(fake: &FakeRunner, latest: bool) {
+        assert!(fake.publish_called);
+        assert_eq!(
+            fake.edit_args.get(0..4).unwrap(),
+            ["release", "edit", "v1.0.0", "--draft=false"]
+        );
+        assert_eq!(fake.edit_args.iter().any(|arg| arg == "--latest"), latest);
+        let download = fake
+            .calls
+            .iter()
+            .position(|(_, args)| args.get(1).is_some_and(|x| x == "download"))
+            .unwrap();
+        let edit = fake
+            .calls
+            .iter()
+            .position(|(_, args)| args.get(1).is_some_and(|x| x == "edit"))
+            .unwrap();
+        assert!(
+            download < edit,
+            "publication must follow asset download and verification"
+        );
     }
     #[test]
     fn publish_rejects_published_release() {
@@ -1696,6 +1741,143 @@ mod tests {
                     .is_some_and(|e| e.ends_with("/releases"))
         }));
         assert!(fake.publish_called);
+    }
+    #[test]
+    fn publish_reordered_assets_resume_and_create() {
+        let names = reordered_release_names();
+        let root = tempfile_dir();
+        let mut resumed = FakeRunner::default();
+        let result = run_publish(
+            &mut resumed,
+            Some(release_json_with(true, false, "sha", "notes", &names)),
+            &root,
+        );
+        assert!(
+            result.is_ok(),
+            "resumed reordered draft rejected: {result:?}"
+        );
+        assert_published_after_download_verification(&resumed, true);
+
+        let root = tempfile_dir();
+        let mut created = FakeRunner {
+            postcreate_release: Some(release_json_with(true, false, "sha", "notes", &names)),
+            ..Default::default()
+        };
+        let result = run_publish(&mut created, None, &root);
+        assert!(
+            result.is_ok(),
+            "created reordered draft rejected: {result:?}"
+        );
+        assert_published_after_download_verification(&created, true);
+    }
+    #[test]
+    fn publish_asset_inventory_rejects_missing_extra_duplicate() {
+        let expected = release_names();
+        for names in [
+            expected[..expected.len() - 1].to_vec(),
+            expected
+                .iter()
+                .cloned()
+                .chain(std::iter::once("unexpected.zip".to_owned()))
+                .collect(),
+            {
+                let mut duplicated = expected.clone();
+                duplicated[0] = duplicated[1].clone();
+                duplicated
+            },
+        ] {
+            assert!(!exact_membership(&names, &expected));
+        }
+        let inventories = [
+            expected[..expected.len() - 1].to_vec(),
+            expected
+                .iter()
+                .cloned()
+                .chain(std::iter::once("unexpected.zip".to_owned()))
+                .collect(),
+            {
+                let mut duplicated = expected.clone();
+                duplicated[0] = duplicated[1].clone();
+                duplicated
+            },
+        ];
+        for names in inventories {
+            for postcreate in [false, true] {
+                let root = tempfile_dir();
+                let invalid = release_json_with(true, false, "sha", "notes", &names);
+                let mut fake = if postcreate {
+                    FakeRunner {
+                        postcreate_release: Some(invalid),
+                        ..Default::default()
+                    }
+                } else {
+                    FakeRunner {
+                        release: Some(invalid),
+                        ..Default::default()
+                    }
+                };
+                let existing = fake.release.clone();
+                assert!(run_publish(&mut fake, existing, &root).is_err());
+                assert!(!fake.publish_called);
+                assert!(
+                    !fake
+                        .calls
+                        .iter()
+                        .any(|(_, args)| args.get(1).is_some_and(|x| x == "download"))
+                );
+            }
+        }
+    }
+    #[test]
+    fn publish_metadata_mismatches_fail_closed_in_resume_and_create_paths() {
+        for (target, body, prerelease) in [
+            ("other", "notes", false),
+            ("sha", "different notes", false),
+            ("sha", "notes", true),
+        ] {
+            for postcreate in [false, true] {
+                let root = tempfile_dir();
+                let invalid = release_json_with(true, prerelease, target, body, &release_names());
+                let mut fake = if postcreate {
+                    FakeRunner {
+                        postcreate_release: Some(invalid),
+                        ..Default::default()
+                    }
+                } else {
+                    FakeRunner {
+                        release: Some(invalid),
+                        ..Default::default()
+                    }
+                };
+                let existing = fake.release.clone();
+                assert!(run_publish(&mut fake, existing, &root).is_err());
+                assert!(!fake.publish_called);
+                assert!(
+                    !fake
+                        .calls
+                        .iter()
+                        .any(|(_, args)| args.get(1).is_some_and(|x| x == "download"))
+                );
+            }
+        }
+    }
+    #[test]
+    fn publish_prerelease_publishes_without_latest() {
+        let root = tempfile_dir();
+        let mut fake = FakeRunner {
+            release: Some(release_json_with(
+                true,
+                true,
+                "sha",
+                "notes",
+                &release_names(),
+            )),
+            ..Default::default()
+        };
+        let release = fake.release.clone();
+        let result = run_publish_with(&mut fake, release, &root, true);
+        assert!(result.is_ok(), "valid prerelease rejected: {result:?}");
+        assert_published_after_download_verification(&fake, false);
     }
     #[test]
     fn publish_multiple_matching_drafts_require_recovery() {
@@ -1874,7 +2056,7 @@ mod tests {
             &mut fake, &root, "v1.0.0", "sha", &notes, "notes", &assets, false,
         );
         assert!(result.is_ok(), "{result:?}");
-        assert!(fake.publish_called);
+        assert_published_after_download_verification(&fake, true);
         let create = fake
             .calls
             .iter()
