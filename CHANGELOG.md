@@ -4,6 +4,16 @@ All notable changes are documented here from observed repository history. Releas
 
 Provisional first-release notes were finalized from inspected history spanning root commit `2684862` through implementation commit `e9544c5`; the subsequent notes-only commits are not part of that inspected history.
 
+## [0.3.2] - 2026-09-23
+
+### Changed
+
+- Provisional: 0.3.2 patch release with unchanged SQLite MCP behavior; finalize from inspected implementation history.
+
+### Platform notes
+
+Release targets and runtime requirements are unchanged: Linux GNU/glibc builds use Ubuntu 24.04, and macOS artifacts target macOS 15 and remain unsigned and unnotarized.
+
 ## [0.3.1] - 2026-09-23
 
 Notes were finalized from inspected history spanning published `v0.3.0` through implementation commit `e84574e` (1 commit); this subsequent notes-only commit is not part of that inspected history.
